@@ -61,3 +61,19 @@ Open edge (Session 1): bank20 `$94FD: JSR $6000` into zeroed SRAM —
 reference never executes it in 120 frames while subject reaches it ~frame
 30 via `$9400`-chain continuation past `$FE08`-return. Suspects: `$FE08`
 epilogue path, or subject-only continuation. Start there.
+
+Session protocol (follow every invocation):
+- Your session == your branch (`mmc3/debug-trap-triage`) in
+  `/home/haruki/nes-to-sms-mmc3-debug`. Confirm with
+  `git branch --show-current` and `pwd` before touching anything; if the
+  cwd is wrong, stop and say so instead of working in the wrong tree.
+- Base freshness: run `git fetch origin && git log --oneline -3
+  mmc3/wip` at start. If `mmc3/wip` or `mmc3/coverage-grind` has commits
+  you lack that touch `profiles/**` or shared engine files, merge them
+  (`git merge mmc3/wip`) before starting — never work on a stale base.
+- Shared file: `profiles/mother.toml` is also edited by the orchestrator
+  (coverage seeds). Before committing, `git fetch origin && git diff
+  origin/mmc3/wip -- profiles/mother.toml`; if it moved under you, merge
+  first, re-run the pipeline + `make`, and only then commit.
+- The task assignment is the user's invocation message, not this file.
+  This file is standing instructions; do exactly the assigned task.

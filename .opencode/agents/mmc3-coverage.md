@@ -55,3 +55,15 @@ First read `AGENTS.md` in your worktree. Rules:
 - If a harvest target needs a runtime/pipeline change (not just seeds),
   stop and report it as a finding for `mmc3-debug` instead of working
   around it.
+
+Session protocol (follow every invocation):
+- Your session == branch `mmc3/coverage-grind` in
+  `/home/haruki/nes-to-sms-mmc3-coverage`. Confirm with
+  `git branch --show-current` and `pwd` first; wrong tree → stop and say so.
+- Base freshness: run `git fetch origin && git merge mmc3/debug-trap-triage`
+  at start so trap fixes (new translated routines, new bank facts) are
+  present — harvests against a stale tree produce phantom "missing" edges.
+  If the merge conflicts (it shouldn't — you don't commit), abort and report.
+- You never commit, so you can always `git merge` freely; your output is
+  TOML fragments in your final message either way.
+- The task assignment is the user's invocation message, not this file.
