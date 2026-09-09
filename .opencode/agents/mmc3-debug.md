@@ -1,7 +1,7 @@
 ---
 description: MMC3 trap triage via $CB1B/$CB1C harvest — use for fail-closed dispatch-miss diagnosis, byte-verifying bank numbers, and fixing lowerer/runtime causes. Owns runtime/** and engine crates on its worktree.
 mode: subagent
-model: opencode-go/deepseek-v4-flash
+model: opencode-go/deepseek-v4-pro
 temperature: 0.1
 steps: 100
 permission:
@@ -56,6 +56,14 @@ Your loop for each hard trap (`$CB1D` marker + `$CB1B/$CB1C` id):
    `cargo test -p <touched crates>`, `cargo fmt --check`.
 5. Commit to your branch (`mmc3/debug-trap-triage`) with a `MMC3:`-prefixed
    message. Report: trap → root cause → fix → verification output.
+
+Budget and stop rule: a single trap engagement is budgeted at ~3 hours.
+If the trap is not resolved by then — or if evidence points at an
+escalation (e.g. reference genuinely executes SRAM-resident code, which
+would require dynamic-translation design rather than a scoped fix) — STOP
+and report: what was tried (with trace excerpts), what was ruled out, and
+what the escalation would cost. Do not burn further iterations hoping the
+next rebuild fixes it; a stuck debug loop is itself a finding.
 
 Open edge (Session 1): bank20 `$94FD: JSR $6000` into zeroed SRAM —
 reference never executes it in 120 frames while subject reaches it ~frame
