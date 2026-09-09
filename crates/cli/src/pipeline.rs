@@ -247,6 +247,55 @@ fn unprefix_cross_window_labels(
     }
 }
 
+/// Retarget `[[bank_call]]` call sites: any `L_XXXX` reference whose target
+/// is annotated by a [[bank_call]] is rewritten to the bank-prefixed label
+/// `L_b{bank}_XXXX`; everything else stays an unresolved strict-trap stub.
+///
+/// UxROM banked units resolve cross-bank calls through the runtime (bank,
+/// addr) dispatch shadow, so a [[bank_call]] hard-binding must not override
+/// them. MMC3 has two independent windows and no live dispatch shadow, so a
+/// cross-window call from a banked unit (e.g. bank-20 LOW code calling
+/// $BF62 in bank-19 HIGH) is otherwise unresolvable — bind it here.
+fn rewrite_bank_call_targets(prof: &profile::Profile, routines: &mut [ir::Routine], mmc3: bool) {
+    if prof.bank_calls.is_empty() {
+        return;
+    }
+    use ir::Op;
+    let map: std::collections::HashMap<String, String> = prof
+        .bank_calls
+        .iter()
+        .map(|bc| {
+            (
+                format!("L_{:04X}", bc.target),
+                format!("L_b{}_{:04X}", bc.bank, bc.target),
+            )
+        })
+        .collect();
+    for r in routines.iter_mut() {
+        if r.name.starts_with("L_b") && !mmc3 {
+            continue; // UxROM banked units use the live dispatch shadow
+        }
+        for op in r.ops.iter_mut() {
+            match op {
+                Op::Jsr { target }
+                | Op::MaterializedJsr { target, .. }
+                | Op::Jmp { target }
+                | Op::ReturnEscape { target, .. } => {
+                    if let Some(new) = map.get(target) {
+                        *target = new.clone();
+                    }
+                }
+                _ => {}
+            }
+        }
+        for lbl in r.external_calls.iter_mut() {
+            if let Some(new) = map.get(lbl) {
+                *lbl = new.clone();
+            }
+        }
+    }
+}
+
 /// `L_F000` is a fixed-window address; `L_b6_A123` is switchable bank 6.
 /// Unqualified switchable labels intentionally return `(None, addr)` because
 /// they mean "the mapper bank selected at runtime" and must not root every
@@ -1689,45 +1738,10 @@ pub fn run(args: &Args) -> Result<String, Error> {
         }
     }
 
-    // 4c. [[bank_call]] rewrites: fixed-bank call sites whose window
-    // target's bank is annotated get retargeted to the bank-prefixed
-    // label; everything else stays an unresolved strict-trap stub.
-    if !prof.bank_calls.is_empty() {
-        use ir::Op;
-        let map: std::collections::HashMap<String, String> = prof
-            .bank_calls
-            .iter()
-            .map(|bc| {
-                (
-                    format!("L_{:04X}", bc.target),
-                    format!("L_b{}_{:04X}", bc.bank, bc.target),
-                )
-            })
-            .collect();
-        for r in routines.iter_mut() {
-            if r.name.starts_with("L_b") {
-                continue; // banked units already carry their own prefix
-            }
-            for op in r.ops.iter_mut() {
-                match op {
-                    Op::Jsr { target }
-                    | Op::MaterializedJsr { target, .. }
-                    | Op::Jmp { target }
-                    | Op::ReturnEscape { target, .. } => {
-                        if let Some(new) = map.get(target) {
-                            *target = new.clone();
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            for lbl in r.external_calls.iter_mut() {
-                if let Some(new) = map.get(lbl) {
-                    *lbl = new.clone();
-                }
-            }
-        }
-    }
+    // 4c. [[bank_call]] rewrites: call sites whose window target's bank is
+    // annotated get retargeted to the bank-prefixed label; everything else
+    // stays an unresolved strict-trap stub (see rewrite_bank_call_targets).
+    rewrite_bank_call_targets(&prof, &mut routines, mmc3);
 
     // Phase S: profile-guided hot grouping. Routines named in the profile's
     // `[translation] hot_group` (from the measured far-transfer histogram)
@@ -2187,9 +2201,8 @@ pub fn run(args: &Args) -> Result<String, Error> {
             pair.extend_from_slice(policy.prg_bank(image.prg, 2 * k + 1)?);
             pairs.push(pair);
         }
-        let blobs = assets::mmc3_chr_banks_to_sms_4bpp(image.chr).map_err(|err| {
-            Error::Diagnostic(format!("MMC3 CHR bank conversion failed: {err}"))
-        })?;
+        let blobs = assets::mmc3_chr_banks_to_sms_4bpp(image.chr)
+            .map_err(|err| Error::Diagnostic(format!("MMC3 CHR bank conversion failed: {err}")))?;
         let mut groups = Vec::with_capacity(blobs.len().div_ceil(8));
         for chunk in blobs.chunks(8) {
             let mut group = Vec::with_capacity(0x4000);
@@ -3044,6 +3057,67 @@ mod tests {
         assert!(
             check_consume_entries(&profile, &[(Some(4), 0xc001)]).is_err(),
             "fixed window is shared"
+        );
+    }
+
+    fn banked_routine(name: &str) -> ir::Routine {
+        ir::Routine {
+            entry: 0x94EC,
+            end: 0x9500,
+            name: name.to_string(),
+            ops: vec![ir::Op::Jsr {
+                target: "L_BF62".to_string(),
+            }],
+            branch_labels: vec![],
+            external_calls: vec!["L_BF62".to_string()],
+            unresolved: vec![],
+        }
+    }
+
+    #[test]
+    fn mmc3_bank_call_rewrites_cross_window_refs_in_banked_units() {
+        // A banked unit (L_b20_94EC, in the LOW window) calls $BF62, which
+        // lives in bank 19's HIGH window. The cross-window ref is unprefixed
+        // to L_BF62 by unprefix_cross_window_labels and must be rebound to
+        // the annotated bank. UxROM banked units must NOT be rebound (they
+        // use the live dispatch shadow).
+        let prof = profile::load_from_str(
+            "[rom]\nname=\"x\"\nmapper=4\nprg_kib=256\nchr_kib=128\n[[bank_call]]\ntarget=0xbf62\nbank=19\n",
+        )
+        .unwrap();
+
+        let mut mmc3_routines = vec![banked_routine("L_b20_94EC")];
+        rewrite_bank_call_targets(&prof, &mut mmc3_routines, true);
+        assert_eq!(
+            mmc3_routines[0].ops[0],
+            ir::Op::Jsr {
+                target: "L_b19_BF62".to_string()
+            },
+            "MMC3 cross-window bank_call must bind the annotated bank"
+        );
+        assert_eq!(mmc3_routines[0].external_calls, vec!["L_b19_BF62"]);
+
+        // UxROM: banked units keep the unprefixed label for live dispatch.
+        let mut uxrom_prof = prof.clone();
+        uxrom_prof.rom.mapper = 2;
+        let mut uxrom_routines = vec![banked_routine("L_b0_94EC")];
+        rewrite_bank_call_targets(&uxrom_prof, &mut uxrom_routines, false);
+        assert_eq!(
+            uxrom_routines[0].ops[0],
+            ir::Op::Jsr {
+                target: "L_BF62".to_string()
+            },
+            "UxROM banked units must resolve through the live dispatch shadow"
+        );
+
+        // Fixed-bank (non-L_b) routines are always rebound.
+        let mut fixed_routines = vec![banked_routine("func_94EC")];
+        rewrite_bank_call_targets(&prof, &mut fixed_routines, true);
+        assert_eq!(
+            fixed_routines[0].ops[0],
+            ir::Op::Jsr {
+                target: "L_b19_BF62".to_string()
+            }
         );
     }
 

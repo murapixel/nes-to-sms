@@ -109,6 +109,60 @@ bank = 20
 target = 0xbf62
 bank = 19
 
+# Session-2 run-A fixed->window call edges (see the run-A header on the
+# [[bank_entry]] group at the end of this file for provenance): each target
+# was observed live under exactly one bank across the 120k-frame harvest
+# (bank8=19 for the b19 HIGH entries, bank8=20 for $952B), and each now has
+# a matching [[bank_entry]]. Static callers run in fixed code
+# ($CC6F/$CCB0/$CCD0/$CCD6/$CCD9/$F30C -> $A0xx/$BDD3; $F313 -> $952B) and
+# in bank-19 LOW ($L_b19_8D54 -> $ABF6); without these bindings the
+# unprefixed cross-window refs stay unresolved and trap (fail closed).
+# $963D $9786 $97B0 $A3F8 $A92F $AB09 $BC73 $BCAA were never executed in any
+# harvest — their banks are unknown, so they are deliberately NOT bound.
+
+[[bank_call]]
+target = 0x952b
+bank = 20
+
+[[bank_call]]
+target = 0xa000
+bank = 19
+
+[[bank_call]]
+target = 0xa123
+bank = 19
+
+[[bank_call]]
+target = 0xa178
+bank = 19
+
+[[bank_call]]
+target = 0xa1b6
+bank = 19
+
+[[bank_call]]
+target = 0xabf6
+bank = 19
+
+[[bank_call]]
+target = 0xbdd3
+bank = 19
+
+# $9BD0 ends with `JSR $F3C5` (JumpEngine dispatch helper) followed by an
+# inline 3-entry pointer table. The table bytes `0D 9C | 11 9C | 15 9C`
+# decode as `ORA $119C` / `SHY $9C15,X` when walked linearly — the SHY at
+# $9C0A is jump-table DATA (the high byte of the $9C11 pointer), never
+# executed. The dispatcher (ASL A / TAY / INY / PLA/PLA -> ($60),Y) reads
+# the table indexed by A (LDA $57 at $9C02) and RTS-dispatches to $9C0D /
+# $9C11 / $9C15, which set X and converge on $9C17 (`JSR $FE6F; STX $7418;
+# JMP $FE75`). Bound as a [[jump_engine]] so the walker stops at the table
+# and the targets root as bank-20 entries instead of tripping fail-closed.
+
+[[jump_engine]]
+caller = 0x9C04
+bank = 20
+targets = ["L_b20_9C0D", "L_b20_9C11", "L_b20_9C15"]
+
 # MMC3 window seeds — ground truth from the reference harvest, never
 # invented. Run 1: FD_LOG_BANK_ENTRIES=1 frame-diff --ref-only, 600 frames,
 # script=none (boot -> title screen, no input). Run 2 (strict superset of
@@ -447,3 +501,149 @@ addr = 0x9ea1
 # JAM opcode 0x0B (ANC #imm — fail-closed in the pipeline), so the routine
 # cannot lower. $E0 clearers already exist in fixed code ($F8BB NMI path,
 # $F963 LDA #0 / STA $E0). Revisit if a future harvest shows bank 18 live.
+
+# Session-2 harvest (run A, s2_runA.sh): 120000 frames, buttons-script
+# /tmp/toolchain/mother_input12.txt (title -> menu -> dialogue, A advances
+# text), FD_PAD_BOTH=1, FD_LOG_BANK_ENTRIES=1; reference PPMs ref_00000..
+# ref_119900 every 10k; log ends "RUN A DONE rc=0". Every entry below was
+# byte-disassembled at the correct window offset (LOW = addr-$8000, HIGH =
+# addr-$A000) and decodes as clean code: b19 HIGH covers menu/dialogue code
+# incl. $A000/$A123/$A178/$A1B6/$BDD3 (unseeded fixed->window refs) and the
+# $BF62 $E5-flag family; b20 $9BD0's SHY-at-$9C0A is jump-table data bounded
+# by the [[jump_engine]] above; b28 $8648 is the shared vector-table routine
+# (10 static JMP/JSR callers). Stale refs $963D $9786 $97B0 $A3F8 $A92F
+# $AB09 $BC73 $BCAA were NEVER executed in any 120k-frame harvest — they are
+# overworld/menu-branch code reached only past the dialogue textbox, so they
+# stay unseeded (no invention).
+
+[[bank_entry]]
+bank = 19
+addr = 0xa000
+
+[[bank_entry]]
+bank = 19
+addr = 0xa08f
+
+[[bank_entry]]
+bank = 19
+addr = 0xa0b3
+
+[[bank_entry]]
+bank = 19
+addr = 0xa123
+
+[[bank_entry]]
+bank = 19
+addr = 0xa178
+
+[[bank_entry]]
+bank = 19
+addr = 0xa1b6
+
+[[bank_entry]]
+bank = 19
+addr = 0xa41f
+
+[[bank_entry]]
+bank = 19
+addr = 0xa97d
+
+[[bank_entry]]
+bank = 19
+addr = 0xaa32
+
+[[bank_entry]]
+bank = 19
+addr = 0xaac5
+
+[[bank_entry]]
+bank = 19
+addr = 0xaacf
+
+[[bank_entry]]
+bank = 19
+addr = 0xaae6
+
+[[bank_entry]]
+bank = 19
+addr = 0xaaf4
+
+[[bank_entry]]
+bank = 19
+addr = 0xaaf7
+
+[[bank_entry]]
+bank = 19
+addr = 0xab14
+
+[[bank_entry]]
+bank = 19
+addr = 0xabf6
+
+[[bank_entry]]
+bank = 19
+addr = 0xac81
+
+[[bank_entry]]
+bank = 19
+addr = 0xbcc6
+
+[[bank_entry]]
+bank = 19
+addr = 0xbcd7
+
+[[bank_entry]]
+bank = 19
+addr = 0xbcf1
+
+[[bank_entry]]
+bank = 19
+addr = 0xbdd3
+
+[[bank_entry]]
+bank = 19
+addr = 0xbf31
+
+[[bank_entry]]
+bank = 20
+addr = 0x952b
+
+[[bank_entry]]
+bank = 20
+addr = 0x95e0
+
+[[bank_entry]]
+bank = 20
+addr = 0x9b6d
+
+[[bank_entry]]
+bank = 20
+addr = 0x9b98
+
+[[bank_entry]]
+bank = 20
+addr = 0x9bab
+
+[[bank_entry]]
+bank = 20
+addr = 0x9bd0
+
+[[bank_entry]]
+bank = 20
+addr = 0x9c2a
+
+[[bank_entry]]
+bank = 20
+addr = 0x9d75
+
+[[bank_entry]]
+bank = 28
+addr = 0x82a2
+
+[[bank_entry]]
+bank = 28
+addr = 0x82b1
+
+[[bank_entry]]
+bank = 28
+addr = 0x8648
