@@ -1127,8 +1127,7 @@ fn lift_insn(
                             pc,
                             opcode: insn.opcode,
                             mnemonic: "STX".to_string(),
-                            reason: "STX to expansion space is unsupported"
-                                .to_string(),
+                            reason: "STX to expansion space is unsupported".to_string(),
                         }]
                     }
                     // SRAM stores lower through the EXRAM shims.
@@ -1167,8 +1166,7 @@ fn lift_insn(
                             pc,
                             opcode: insn.opcode,
                             mnemonic: "STY".to_string(),
-                            reason: "STY to expansion space is unsupported"
-                                .to_string(),
+                            reason: "STY to expansion space is unsupported".to_string(),
                         }]
                     }
                     // SRAM stores lower through the EXRAM shims.

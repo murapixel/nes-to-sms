@@ -2187,9 +2187,8 @@ pub fn run(args: &Args) -> Result<String, Error> {
             pair.extend_from_slice(policy.prg_bank(image.prg, 2 * k + 1)?);
             pairs.push(pair);
         }
-        let blobs = assets::mmc3_chr_banks_to_sms_4bpp(image.chr).map_err(|err| {
-            Error::Diagnostic(format!("MMC3 CHR bank conversion failed: {err}"))
-        })?;
+        let blobs = assets::mmc3_chr_banks_to_sms_4bpp(image.chr)
+            .map_err(|err| Error::Diagnostic(format!("MMC3 CHR bank conversion failed: {err}")))?;
         let mut groups = Vec::with_capacity(blobs.len().div_ceil(8));
         for chunk in blobs.chunks(8) {
             let mut group = Vec::with_capacity(0x4000);
