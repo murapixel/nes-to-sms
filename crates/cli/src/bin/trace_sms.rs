@@ -34,6 +34,12 @@ fn real_pacing() -> bool {
     std::env::var("SMS_REAL_PACING").is_ok()
 }
 fn irq_period() -> usize {
+    if let Ok(v) = std::env::var("SMS_IRQ_PERIOD")
+        && let Ok(n) = v.parse::<usize>()
+        && n >= 1_000
+    {
+        return n;
+    }
     if real_pacing() { 15_000 } else { IRQ_PERIOD }
 }
 
@@ -4849,6 +4855,16 @@ fn main() {
             eprintln!("PPM dump failed: {e}");
         } else {
             println!("Wrote framebuffer PPM to {path}");
+        }
+    }
+
+    // Dump SMS work RAM ($C000-$DFFF: NES ZP/RAM/stack/shadows) to a flat
+    // binary if requested by env var SMS_DUMP_RAM. Used to read 6502 stack
+    // return chains and RAM state at stuck points.
+    if let Ok(path) = std::env::var("SMS_DUMP_RAM") {
+        match std::fs::write(&path, &bus.ram) {
+            Ok(()) => println!("Wrote RAM dump to {path}"),
+            Err(e) => eprintln!("RAM dump failed: {e}"),
         }
     }
 

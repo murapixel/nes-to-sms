@@ -195,6 +195,58 @@ fn routine_auto_label(r: &ir::Routine) -> String {
 }
 
 /// Parse profile jump-engine target labels into their physical identity.
+/// Strip this view's bank prefix from cross-window label references in an
+/// MMC3 window routine. A `(bank, window)` analysis view maps the companion
+/// window to its power-on bank, so a reference into the other window would
+/// otherwise resolve to companion-bank bytes at runtime (when the other
+/// window holds its live bank). Unprefixed `L_XXXX` refs resolve through
+/// [[bank_call]] facts or fail closed as unresolved — never to the wrong
+/// bank's bytes. Same-window refs keep their prefix (direct static labels).
+fn unprefix_cross_window_labels(
+    routine: &mut ir::Routine,
+    prefix: &str,
+    window: analysis::AnalysisWindow,
+) {
+    let tagged = format!("L_{prefix}");
+    let fix = |label: &mut String| {
+        if let Some(hex) = label.strip_prefix(tagged.as_str())
+            && hex.len() == 4
+            && let Ok(addr) = u16::from_str_radix(hex, 16)
+            && !window.contains(addr)
+        {
+            *label = format!("L_{hex}");
+        }
+    };
+    for op in routine.ops.iter_mut() {
+        match op {
+            ir::Op::Label(name) => fix(name),
+            ir::Op::BranchIf { target, .. } | ir::Op::Jmp { target } | ir::Op::Jsr { target } => {
+                fix(target)
+            }
+            ir::Op::ReturnEscape { target, .. } | ir::Op::MaterializedJsr { target, .. } => {
+                fix(target)
+            }
+            ir::Op::JumpEngineCall {
+                targets,
+                return_target,
+                ..
+            } => {
+                for t in targets.iter_mut().chain(return_target.iter_mut()) {
+                    fix(t);
+                }
+            }
+            _ => {}
+        }
+    }
+    for lbl in routine
+        .branch_labels
+        .iter_mut()
+        .chain(routine.external_calls.iter_mut())
+    {
+        fix(lbl);
+    }
+}
+
 /// `L_F000` is a fixed-window address; `L_b6_A123` is switchable bank 6.
 /// Unqualified switchable labels intentionally return `(None, addr)` because
 /// they mean "the mapper bank selected at runtime" and must not root every
@@ -397,9 +449,13 @@ fn emit_translated_routine(
     let auto = routine_auto_label(r);
     // A stub-body replacement supersedes the whole translated body: any
     // entry (JSR, JMP, computed dispatch, or a conditional branch from a
-    // neighboring routine) lands on `call hook / ret`. Interior labels are
-    // not emitted; a surviving external reference to one fails closed
-    // through the unresolved-label machinery.
+    // neighboring routine) lands on the hook. Interior labels are not
+    // emitted; a surviving external reference to one fails closed through
+    // the unresolved-label machinery. The return discipline matches the
+    // profile: native `ret` for native-call builds (SMB), but translated
+    // `jp rt_translated_rts` (pop $D300 continuation) for software-frame
+    // builds — a native `ret` there would pop a stale native return (callers
+    // arrive via jump, not call) and leak the $D300 frame.
     if let Some(profile) = opts.profile
         && let Some(rep) = profile.replacement_for(r.entry)
         && rep.stub_body
@@ -413,7 +469,14 @@ fn emit_translated_routine(
         }
         defined_labels.insert(r.name.clone());
         program.call(&rep.runtime_label.clone());
-        program.ret();
+        if profile.native_calls() {
+            program.ret();
+        } else {
+            // Software-frame discipline: pop the $D300 continuation pushed
+            // by the translated call and jump to the caller (a native `ret`
+            // would pop a stale native return — callers arrive via jump).
+            program.jp("rt_translated_rts");
+        }
         return Ok(());
     }
     let lifter_emits_auto = r.branch_labels.contains(&auto) || r.name == auto;
@@ -516,15 +579,168 @@ pub fn run(args: &Args) -> Result<String, Error> {
             prof.rom.mapper, image.header.mapper
         )));
     }
-    let policy = nes_rom::resolve_mapper_policy(&image.header, image.prg.len())?;
-    // Profile validation checks declared mapper-2 bank bounds. Recheck
+    /// MMC3 discovery-only mode (mapper plan M3): the loader, reference bus,
+    /// profile schema and window views have landed, but IR lowering and runtime
+    /// emission are still Phase M3 work. Run fixed + windowed discovery, write
+    /// the classification reports that guide `[[bank_entry]]` authoring, then
+    /// fail closed instead of emitting a bogus project.
+    fn run_mmc3_discovery_only(
+        args: &Args,
+        image: &nes_rom::Image<'_>,
+        prof: &profile::Profile,
+        policy: nes_rom::MapperPolicy,
+        prg_8k_count: u8,
+        vectors: nes_rom::Vectors,
+    ) -> Result<String, Error> {
+        use analysis::AnalysisWindow as W;
+        use std::collections::BTreeSet;
+
+        let mut txt = String::new();
+        txt.push_str(
+            "MMC3 discovery-only: lowering/runtime emission not yet wired; no project emitted.\n",
+        );
+        txt.push_str(
+        "Fixed pass assumes PRG mode 0 ($C000-$DFFF = second-last bank); $E000-$FFFF is mode-independent.\n",
+    );
+
+        // Fixed pass over the mode-0 top: [fixed16 | fixed16] so every
+        // $8000-$FFFF offset lands in fixed bytes; the walk is constrained to
+        // $C000-$FFFF and rooted at vectors + profile fixed sites. Bankless
+        // jump-engine sites are fixed (validation forces window callers to
+        // carry banks).
+        let fixed_bytes = policy.fixed_prg(image.prg);
+        let mut fixed_view = Vec::with_capacity(2 * fixed_bytes.len());
+        fixed_view.extend_from_slice(fixed_bytes);
+        fixed_view.extend_from_slice(fixed_bytes);
+        let mut fixed_prof = prof.clone();
+        fixed_prof.functions.retain(|f| f.addr >= 0xC000);
+        fixed_prof.jump_engines.retain(|site| site.bank.is_none());
+        let fixed = analyze_with_continuation_roots(
+            &fixed_view,
+            nes_rom_like::Vectors {
+                nmi: vectors.nmi,
+                reset: vectors.reset,
+                irq: vectors.irq,
+            },
+            &mut fixed_prof,
+            W::FIXED_16K,
+            None,
+        );
+        let (code, data, unknown) = fixed.class_map.summary();
+        txt.push_str(&format!(
+        "fixed mode-0 top: {} functions, {code} code / {data} data / {unknown} unknown view bytes\n",
+        fixed.functions.functions.len()
+    ));
+        let mut fixed_window_refs = BTreeSet::new();
+        for f in &fixed.functions.functions {
+            for &ext in &f.external_refs {
+                if (0x8000..0xC000).contains(&ext) {
+                    fixed_window_refs.insert(ext);
+                }
+            }
+        }
+        // Live 8 KiB banks for these come from the reference harvest
+        // (FD_LOG_BANK_ENTRIES -> MMC3_ENTRY), never invented here.
+        for ext in &fixed_window_refs {
+            let window = if *ext < 0xA000 { "LOW " } else { "HIGH" };
+            txt.push_str(&format!("  fixed -> window {window} ${ext:04X}\n"));
+        }
+        // Static contiguous-idiom candidates (UNVERIFIED: linear matching
+        // cannot see joins — confirm each against the MMC3_ENTRY harvest
+        // before writing a [[bank_entry]]). Scan only the $C000+ half: the
+        // view's low half mirrors the same fixed bytes at $8000-$BFFF coords,
+        // where they are not real window code.
+        for candidate in
+            nes_rom::harvest_mmc3_bank_candidates(&fixed_view[fixed_bytes.len()..], prg_8k_count)
+        {
+            txt.push_str(&format!(
+            "  CANDIDATE bank8={} target=${:04X} (at ${:04X}, mode {}) — verify via reference harvest\n",
+            candidate.window_bank,
+            candidate.target,
+            0xC000 + candidate.offset,
+            u8::from(candidate.prg_mode),
+        ));
+        }
+
+        // Window passes, grouped by (bank, window). The companion window holds
+        // its power-on bank (R6=0 low, R7=1 high); the walk never leaves the
+        // entry window, so it only shapes stray decodes, never roots.
+        let mut groups: std::collections::BTreeMap<(u8, bool), Vec<u16>> =
+            std::collections::BTreeMap::new();
+        for entry in &prof.bank_entries {
+            groups
+                .entry((entry.bank, entry.addr < 0xA000))
+                .or_default()
+                .push(entry.addr);
+        }
+        let mut window_funcs = 0usize;
+        for ((bank, low), addrs) in &groups {
+            let window = if *low {
+                W::SWITCHABLE_8K_LOW
+            } else {
+                W::SWITCHABLE_8K_HIGH
+            };
+            let (low_bank, high_bank) = if *low { (*bank, 1) } else { (0, *bank) };
+            let view = nes_rom::mmc3_analysis_view(image.prg, prg_8k_count, low_bank, high_bank)?;
+            let mut wprof = prof.clone();
+            wprof.functions = addrs
+                .iter()
+                .map(|&addr| profile::Function {
+                    addr,
+                    name: format!("L_b{bank}_{addr:04X}"),
+                    note: None,
+                })
+                .collect();
+            wprof.jump_tables.clear();
+            wprof
+                .jump_engines
+                .retain(|site| site.bank == Some(*bank) && window.contains(site.caller));
+            let analyzed = analyze_with_continuation_roots(
+                &view,
+                nes_rom_like::Vectors {
+                    nmi: 0,
+                    reset: 0,
+                    irq: 0,
+                },
+                &mut wprof,
+                window,
+                Some(*bank),
+            );
+            let (wcode, wdata, wunknown) = analyzed.class_map.summary();
+            let name = if *low { "LOW " } else { "HIGH" };
+            txt.push_str(&format!(
+            "window {name} bank8={bank}: {} functions, {wcode} code / {wdata} data / {wunknown} unknown view bytes\n",
+            analyzed.functions.functions.len()
+        ));
+            window_funcs += analyzed.functions.functions.len();
+            let mut externals = BTreeSet::new();
+            for f in &analyzed.functions.functions {
+                externals.extend(f.external_refs.iter().copied());
+            }
+            for ext in externals {
+                txt.push_str(&format!("  bank8={bank} ${ext:04X}\n"));
+            }
+        }
+
+        let reports_dir = args.out.join("reports");
+        std::fs::create_dir_all(&reports_dir)?;
+        std::fs::write(reports_dir.join("discovery.txt"), &txt)?;
+        Err(Error::Diagnostic(format!(
+            "mapper 4 (MMC3) discovery-only: {} fixed + {window_funcs} window functions, {} fixed->window refs; see out/reports/discovery.txt (lowering not yet wired)",
+            fixed.functions.functions.len(),
+            fixed_window_refs.len()
+        )))
+    }
+    // Profile validation checks declared bank bounds per mapper. Recheck
     // against the parsed ROM policy before any banked analysis slicing.
+    let policy = nes_rom::resolve_mapper_policy(&image.header, image.prg.len())?;
     if policy.is_banked() {
         let actual_bank_count = policy.bank_count();
+        let mapper = prof.rom.mapper;
         for entry in &prof.bank_entries {
             if entry.bank >= actual_bank_count {
                 return Err(Error::Diagnostic(format!(
-                    "bank_entry bank {} is out of range for parsed ROM's {actual_bank_count} mapper 2 banks",
+                    "bank_entry bank {} is out of range for parsed ROM's {actual_bank_count} mapper {mapper} banks",
                     entry.bank
                 )));
             }
@@ -532,7 +748,7 @@ pub fn run(args: &Args) -> Result<String, Error> {
         for call in &prof.bank_calls {
             if call.bank >= actual_bank_count {
                 return Err(Error::Diagnostic(format!(
-                    "bank_call bank {} is out of range for parsed ROM's {actual_bank_count} mapper 2 banks",
+                    "bank_call bank {} is out of range for parsed ROM's {actual_bank_count} mapper {mapper} banks",
                     call.bank
                 )));
             }
@@ -554,6 +770,12 @@ pub fn run(args: &Args) -> Result<String, Error> {
             )));
         }
     }
+
+    // MMC3 flows through the banked paths below with 8 KiB (bank, window)
+    // units: fixed code comes from the doubled fixed view, window units
+    // from mmc3_analysis_view per (bank, LOW/HIGH) group. run_mmc3_discovery_only
+    // above remains for report-only runs.
+    let mmc3 = matches!(policy, nes_rom::MapperPolicy::Mmc3 { .. });
 
     // 3. Analyze. UxROM fixed code is discovered exactly once. Each physical
     // switchable bank is analyzed separately below and is rooted only by its
@@ -588,6 +810,18 @@ pub fn run(args: &Args) -> Result<String, Error> {
             .or_default()
             .push(entry.addr);
     }
+    // MMC3 groups by (8 KiB bank, LOW/HIGH window): address ranges never
+    // overlap across windows, so (bank, addr) stays unique.
+    let mut mmc3_entries_by_group: std::collections::BTreeMap<(u8, bool), Vec<u16>> =
+        std::collections::BTreeMap::new();
+    if mmc3 {
+        for entry in &prof.bank_entries {
+            mmc3_entries_by_group
+                .entry((entry.bank, entry.addr < 0xA000))
+                .or_default()
+                .push(entry.addr);
+        }
+    }
     // A profiled inline table is a real reachability edge. Root its fixed
     // targets and its explicitly bank-qualified window targets; leave
     // unqualified window targets dynamic so analysis never invents physical
@@ -598,10 +832,20 @@ pub fn run(args: &Args) -> Result<String, Error> {
                 && addr < 0xC000
             {
                 bank_entries_by_bank.entry(bank).or_default().push(addr);
+                if mmc3 {
+                    mmc3_entries_by_group
+                        .entry((bank, addr < 0xA000))
+                        .or_default()
+                        .push(addr);
+                }
             }
         }
     }
     for entries in bank_entries_by_bank.values_mut() {
+        entries.sort_unstable();
+        entries.dedup();
+    }
+    for entries in mmc3_entries_by_group.values_mut() {
         entries.sort_unstable();
         entries.dedup();
     }
@@ -632,58 +876,133 @@ pub fn run(args: &Args) -> Result<String, Error> {
         }
     }
     if banked {
-        for (&bank, entries) in &bank_entries_by_bank {
-            let view = policy.analysis_view(image.prg, bank)?;
-            let mut window_prof = prof.clone();
-            window_prof.functions = entries
-                .iter()
-                .map(|&addr| profile::Function {
-                    addr,
-                    name: format!("L_b{bank}_{addr:04X}"),
-                    note: None,
-                })
-                .collect();
-            window_prof.jump_tables.clear();
-            window_prof
-                .jump_engines
-                .retain(|site| site.bank == Some(bank));
-            let window_analysis = analyze_with_continuation_roots(
-                &view,
-                nes_rom_like::Vectors {
-                    nmi: 0,
-                    reset: 0,
-                    irq: 0,
-                },
-                &mut window_prof,
-                analysis::AnalysisWindow::SWITCHABLE_16K,
-                Some(bank),
-            );
-            for target in window_analysis
-                .functions
-                .functions
-                .iter()
-                .flat_map(|function| function.external_refs.iter().copied())
-                .filter(|&target| target >= 0xC000)
-            {
-                if fixed_prof
+        if mmc3 {
+            // MMC3 fixed-pre-pass: one view per (bank, window) group with
+            // the companion window holding its power-on bank (R6=0 low,
+            // R7=1 high), exactly like the discovery pass.
+            let prg_8k_count = policy.bank_count();
+            for ((bank, low), entries) in &mmc3_entries_by_group {
+                let (low_bank, high_bank) = if *low { (*bank, 1) } else { (0, *bank) };
+                let view =
+                    nes_rom::mmc3_analysis_view(image.prg, prg_8k_count, low_bank, high_bank)?;
+                let window = if *low {
+                    analysis::AnalysisWindow::SWITCHABLE_8K_LOW
+                } else {
+                    analysis::AnalysisWindow::SWITCHABLE_8K_HIGH
+                };
+                let mut window_prof = prof.clone();
+                window_prof.functions = entries
+                    .iter()
+                    .map(|&addr| profile::Function {
+                        addr,
+                        name: format!("L_b{bank}_{addr:04X}"),
+                        note: None,
+                    })
+                    .collect();
+                window_prof.jump_tables.clear();
+                window_prof
+                    .jump_engines
+                    .retain(|site| site.bank == Some(*bank) && window.contains(site.caller));
+                let window_analysis = analyze_with_continuation_roots(
+                    &view,
+                    nes_rom_like::Vectors {
+                        nmi: 0,
+                        reset: 0,
+                        irq: 0,
+                    },
+                    &mut window_prof,
+                    window,
+                    Some(*bank),
+                );
+                for target in window_analysis
+                    .functions
                     .functions
                     .iter()
-                    .all(|function| function.addr != target)
+                    .flat_map(|function| function.external_refs.iter().copied())
+                    .filter(|&target| target >= 0xC000)
                 {
-                    fixed_prof.functions.push(profile::Function {
-                        addr: target,
-                        name: prof
-                            .label_for(target)
-                            .map(str::to_owned)
-                            .unwrap_or_else(|| format!("func_{target:04X}")),
-                        note: Some(format!("called from mapper bank {bank}")),
-                    });
+                    if fixed_prof
+                        .functions
+                        .iter()
+                        .all(|function| function.addr != target)
+                    {
+                        fixed_prof.functions.push(profile::Function {
+                            addr: target,
+                            name: prof
+                                .label_for(target)
+                                .map(str::to_owned)
+                                .unwrap_or_else(|| format!("func_{target:04X}")),
+                            note: Some(format!("called from MMC3 bank {bank}")),
+                        });
+                    }
                 }
             }
-        }
+        } else {
+            for (&bank, entries) in &bank_entries_by_bank {
+                let view = policy.analysis_view(image.prg, bank)?;
+                let mut window_prof = prof.clone();
+                window_prof.functions = entries
+                    .iter()
+                    .map(|&addr| profile::Function {
+                        addr,
+                        name: format!("L_b{bank}_{addr:04X}"),
+                        note: None,
+                    })
+                    .collect();
+                window_prof.jump_tables.clear();
+                window_prof
+                    .jump_engines
+                    .retain(|site| site.bank == Some(bank));
+                let window_analysis = analyze_with_continuation_roots(
+                    &view,
+                    nes_rom_like::Vectors {
+                        nmi: 0,
+                        reset: 0,
+                        irq: 0,
+                    },
+                    &mut window_prof,
+                    analysis::AnalysisWindow::SWITCHABLE_16K,
+                    Some(bank),
+                );
+                for target in window_analysis
+                    .functions
+                    .functions
+                    .iter()
+                    .flat_map(|function| function.external_refs.iter().copied())
+                    .filter(|&target| target >= 0xC000)
+                {
+                    if fixed_prof
+                        .functions
+                        .iter()
+                        .all(|function| function.addr != target)
+                    {
+                        fixed_prof.functions.push(profile::Function {
+                            addr: target,
+                            name: prof
+                                .label_for(target)
+                                .map(str::to_owned)
+                                .unwrap_or_else(|| format!("func_{target:04X}")),
+                            note: Some(format!("called from mapper bank {bank}")),
+                        });
+                    }
+                }
+            }
+        } // end UxROM per-bank pre-pass (`else` of the MMC3 branch above)
         fixed_prof.jump_engines.retain(|site| site.bank.is_none());
     }
-    let analysis_view = policy.analysis_view(image.prg, 0)?;
+    // MMC3 fixed code is mode-independent only in $E000-$FFFF; the
+    // discovery pass reads the fixed 16 KiB doubled, constraining the walk
+    // to $C000-$FFFF (mode-0 top). Emission reuses that exact view so
+    // fixed labels resolve to the same bytes the reports describe.
+    let analysis_view: Vec<u8> = if mmc3 {
+        let fixed_bytes = policy.fixed_prg(image.prg);
+        let mut doubled = Vec::with_capacity(2 * fixed_bytes.len());
+        doubled.extend_from_slice(fixed_bytes);
+        doubled.extend_from_slice(fixed_bytes);
+        doubled
+    } else {
+        policy.analysis_view(image.prg, 0)?
+    };
     let analysis_vectors = nes_rom_like::Vectors {
         nmi: vectors.nmi,
         reset: vectors.reset,
@@ -805,163 +1124,349 @@ pub fn run(args: &Args) -> Result<String, Error> {
     // at its verified entries and constrained to $8000-$BFFF. Calls into the
     // fixed window were folded into the one fixed pass above.
     if banked && !prof.bank_entries.is_empty() {
-        for (bank, entries) in bank_entries_by_bank {
-            let view = policy.analysis_view(image.prg, bank)?;
-            let prefix = format!("b{bank}_");
-            let mut bprof = prof.clone();
-            bprof.functions = entries
-                .iter()
-                .map(|&a| profile::Function {
-                    addr: a,
-                    name: format!("L_{prefix}{a:04X}"),
-                    note: None,
-                })
-                .collect();
-            bprof.jump_tables.clear();
-            bprof.jump_engines.retain(|site| site.bank == Some(bank));
-            let banalyzed = analyze_with_continuation_roots(
-                &view,
-                nes_rom_like::Vectors {
-                    nmi: 0,
-                    reset: 0,
-                    irq: 0,
-                },
-                &mut bprof,
-                analysis::AnalysisWindow::SWITCHABLE_16K,
-                Some(bank),
-            );
-            let mut bfuncs: Vec<analysis::DiscoveredFunction> =
-                banalyzed.functions.functions.clone();
-            for f in &bfuncs {
-                consume_entries.push((Some(bank), f.addr));
-                consume_entries.extend(
-                    f.external_refs
-                        .iter()
-                        .chain(f.internal_labels.iter())
-                        .map(|&pc| (Some(bank), pc)),
-                );
-            }
-            bfuncs.sort_by_key(|f| f.addr);
-            bfuncs.dedup_by_key(|f| f.addr);
-            if std::env::var("N2S_DEBUG_BANKFUNCS").is_ok() {
-                for f in &bfuncs {
-                    eprintln!("bank{bank} func ${:04X}-${:04X} {}", f.addr, f.end, f.name);
-                }
-            }
-            for w in 0..bfuncs.len().saturating_sub(1) {
-                let next = bfuncs[w + 1].addr;
-                if bfuncs[w].end > next {
-                    bfuncs[w].end = next;
-                }
-            }
-            let bank_jump_engine_sites: Vec<ir::JumpEngineSite> = prof
-                .jump_engines
-                .iter()
-                .filter(|site| site.bank == Some(bank))
-                .map(|site| ir::JumpEngineSite {
-                    caller: site.caller,
-                    targets: site.targets.clone(),
-                    return_target: site.return_target.clone(),
-                    tail_indices: site.tail_indices.clone(),
-                    stack_return_bytes: site.stack_return_bytes,
-                    target_entry_a: site.target_entry_a.clone(),
-                })
-                .collect();
-            let bank_return_escape_sites: Vec<ir::ReturnEscapeSite> = prof
-                .return_escapes
-                .iter()
-                .filter(|site| site.bank == Some(bank))
-                .map(|site| ir::ReturnEscapeSite {
-                    caller: site.caller,
-                    target: site.target,
-                    return_addr: site.return_addr,
-                    stack_bytes_already_consumed: site.stack_bytes_already_consumed,
-                    consume_at: site.consume_at,
-                })
-                .collect();
-            // Interior-alias pass (mirrors the main funcs' two-pass):
-            // collect every referenced window pc, then re-lift with
-            // extra labels so cross-routine branch targets resolve.
-            let mut bank_referenced: std::collections::HashSet<u16> = Default::default();
-            for f in &bfuncs {
-                let opts = ir::LiftOptions {
-                    start: f.addr,
-                    end: f.end,
-                    entry_name: String::new(),
-                    jump_engine_sites: bank_jump_engine_sites.clone(),
-                    return_escape_sites: bank_return_escape_sites.clone(),
-                    return_consume_sites: return_consume_sites(&prof, Some(bank)),
-                    materialized_call_sites: materialized_call_sites(&prof, Some(bank)),
-                    window_label_prefix: (f.addr < 0xC000).then(|| prefix.clone()),
-                    extra_label_pcs: Vec::new(),
+        // MMC3 window units keyed by (8 KiB bank, LOW/HIGH window). Mirrors
+        // the UxROM loop below with window views; see the callouts.
+        if mmc3 {
+            let prg_8k_count = policy.bank_count();
+            for ((bank, low), entries) in &mmc3_entries_by_group {
+                let bank = *bank;
+                let entry_low = *low;
+                let window = if entry_low {
+                    analysis::AnalysisWindow::SWITCHABLE_8K_LOW
+                } else {
+                    analysis::AnalysisWindow::SWITCHABLE_8K_HIGH
                 };
-                if let Ok(r) = ir::lift_range(&view, &opts) {
-                    for lbl in r.branch_labels.iter().chain(r.external_calls.iter()) {
-                        if let Some(hex) = lbl
-                            .strip_prefix(&format!("L_{prefix}"))
-                            .or_else(|| lbl.strip_prefix("L_"))
-                            && hex.len() == 4
-                            && let Ok(a) = u16::from_str_radix(hex, 16)
-                        {
-                            bank_referenced.insert(a);
-                        }
+                let (low_bank, high_bank) = if entry_low { (bank, 1) } else { (0, bank) };
+                let view =
+                    nes_rom::mmc3_analysis_view(image.prg, prg_8k_count, low_bank, high_bank)?;
+                let prefix = format!("b{bank}_");
+                let mut bprof = prof.clone();
+                bprof.functions = entries
+                    .iter()
+                    .map(|&a| profile::Function {
+                        addr: a,
+                        name: format!("L_{prefix}{a:04X}"),
+                        note: None,
+                    })
+                    .collect();
+                bprof.jump_tables.clear();
+                bprof
+                    .jump_engines
+                    .retain(|site| site.bank == Some(bank) && window.contains(site.caller));
+                let banalyzed = analyze_with_continuation_roots(
+                    &view,
+                    nes_rom_like::Vectors {
+                        nmi: 0,
+                        reset: 0,
+                        irq: 0,
+                    },
+                    &mut bprof,
+                    window,
+                    Some(bank),
+                );
+                let mut bfuncs: Vec<analysis::DiscoveredFunction> =
+                    banalyzed.functions.functions.clone();
+                for f in &bfuncs {
+                    // Fail closed if the analyzer leaks across the window:
+                    // bytes would decode under the companion bank.
+                    if !window.contains(f.addr) || f.end > window.end_inclusive + 1 {
+                        return Err(Error::Diagnostic(format!(
+                            "MMC3 bank{bank} window walk escaped {}: ${:04X}-${:04X}",
+                            if entry_low { "LOW" } else { "HIGH" },
+                            f.addr,
+                            f.end,
+                        )));
+                    }
+                    consume_entries.push((Some(bank), f.addr));
+                    consume_entries.extend(
+                        f.external_refs
+                            .iter()
+                            .chain(f.internal_labels.iter())
+                            .map(|&pc| (Some(bank), pc)),
+                    );
+                }
+                bfuncs.sort_by_key(|f| f.addr);
+                bfuncs.dedup_by_key(|f| f.addr);
+                for w in 0..bfuncs.len().saturating_sub(1) {
+                    let next = bfuncs[w + 1].addr;
+                    if bfuncs[w].end > next {
+                        bfuncs[w].end = next;
                     }
                 }
-            }
-            for f in &bfuncs {
-                let in_window = f.addr < 0xC000;
-                let extras: Vec<u16> = bank_referenced
+                let bank_jump_engine_sites: Vec<ir::JumpEngineSite> = prof
+                    .jump_engines
                     .iter()
-                    .filter(|&&pc| pc > f.addr && pc < f.end)
-                    .copied()
+                    .filter(|site| site.bank == Some(bank) && window.contains(site.caller))
+                    .map(|site| ir::JumpEngineSite {
+                        caller: site.caller,
+                        targets: site.targets.clone(),
+                        return_target: site.return_target.clone(),
+                        tail_indices: site.tail_indices.clone(),
+                        stack_return_bytes: site.stack_return_bytes,
+                        target_entry_a: site.target_entry_a.clone(),
+                    })
                     .collect();
-                let opts = ir::LiftOptions {
-                    start: f.addr,
-                    end: f.end,
-                    entry_name: if in_window {
-                        format!("L_{prefix}{:04X}", f.addr)
-                    } else {
-                        format_label(f.addr)
-                    },
-                    jump_engine_sites: bank_jump_engine_sites.clone(),
-                    return_escape_sites: bank_return_escape_sites.clone(),
-                    return_consume_sites: return_consume_sites(&prof, Some(bank)),
-                    materialized_call_sites: materialized_call_sites(&prof, Some(bank)),
-                    window_label_prefix: in_window.then(|| prefix.clone()),
-                    extra_label_pcs: extras,
-                };
-                match ir::lift_range(&view, &opts) {
-                    Ok(mut r) => {
-                        ir::mark_rts_dispatch(&mut r.ops);
-                        let has_terminator = r.ops.last().is_some_and(ir::Op::is_hard_terminator);
-                        if !has_terminator {
-                            // Trimmed fallthrough: continue into the next
-                            // routine via an explicit jump (bank-prefixed
-                            // when the target is in the window).
-                            let tgt = if r.end < 0xC000 {
-                                format!("L_{prefix}{:04X}", r.end)
-                            } else {
-                                format_label(r.end)
-                            };
-                            if !r.external_calls.contains(&tgt) {
-                                r.external_calls.push(tgt.clone());
-                            }
-                            r.ops.push(ir::Op::Jmp { target: tgt });
-                        }
+                let bank_return_escape_sites: Vec<ir::ReturnEscapeSite> = prof
+                    .return_escapes
+                    .iter()
+                    .filter(|site| site.bank == Some(bank))
+                    .map(|site| ir::ReturnEscapeSite {
+                        caller: site.caller,
+                        target: site.target,
+                        return_addr: site.return_addr,
+                        stack_bytes_already_consumed: site.stack_bytes_already_consumed,
+                        consume_at: site.consume_at,
+                    })
+                    .collect();
+                let mut bank_referenced: std::collections::HashSet<u16> = Default::default();
+                for f in &bfuncs {
+                    let opts = ir::LiftOptions {
+                        start: f.addr,
+                        end: f.end,
+                        entry_name: String::new(),
+                        jump_engine_sites: bank_jump_engine_sites.clone(),
+                        return_escape_sites: bank_return_escape_sites.clone(),
+                        return_consume_sites: return_consume_sites(&prof, Some(bank)),
+                        materialized_call_sites: materialized_call_sites(&prof, Some(bank)),
+                        window_label_prefix: window.contains(f.addr).then(|| prefix.clone()),
+                        extra_label_pcs: Vec::new(),
+                    };
+                    if let Ok(r) = ir::lift_range(&view, &opts) {
                         for lbl in r.branch_labels.iter().chain(r.external_calls.iter()) {
-                            if let Some(hex) = lbl.strip_prefix("L_")
+                            if let Some(hex) = lbl
+                                .strip_prefix(&format!("L_{prefix}"))
+                                .or_else(|| lbl.strip_prefix("L_"))
                                 && hex.len() == 4
                                 && let Ok(a) = u16::from_str_radix(hex, 16)
                             {
-                                all_referenced_pcs.insert(a);
+                                bank_referenced.insert(a);
                             }
                         }
-                        banked_routines.push(r)
                     }
-                    Err(e) => lift_failures.push(format!("bank{bank} ${:04X}: {:?}", f.addr, e)),
+                }
+                for f in &bfuncs {
+                    let in_window = window.contains(f.addr);
+                    let extras: Vec<u16> = bank_referenced
+                        .iter()
+                        .filter(|&&pc| pc > f.addr && pc < f.end)
+                        .copied()
+                        .collect();
+                    let opts = ir::LiftOptions {
+                        start: f.addr,
+                        end: f.end,
+                        entry_name: if in_window {
+                            format!("L_{prefix}{:04X}", f.addr)
+                        } else {
+                            format_label(f.addr)
+                        },
+                        jump_engine_sites: bank_jump_engine_sites.clone(),
+                        return_escape_sites: bank_return_escape_sites.clone(),
+                        return_consume_sites: return_consume_sites(&prof, Some(bank)),
+                        materialized_call_sites: materialized_call_sites(&prof, Some(bank)),
+                        window_label_prefix: in_window.then(|| prefix.clone()),
+                        extra_label_pcs: extras,
+                    };
+                    match ir::lift_range(&view, &opts) {
+                        Ok(mut r) => {
+                            ir::mark_rts_dispatch(&mut r.ops);
+                            // Cross-window refs carry this view's bank prefix
+                            // but execute under the OTHER window's live bank
+                            // (the companion image here is power-on, not
+                            // live). Strip the prefix so they resolve through
+                            // [[bank_call]] facts or fail closed as
+                            // unresolved — never to companion-bank bytes.
+                            unprefix_cross_window_labels(&mut r, &prefix, window);
+                            let has_terminator =
+                                r.ops.last().is_some_and(ir::Op::is_hard_terminator);
+                            if !has_terminator {
+                                let tgt = if window.contains(r.end) {
+                                    format!("L_{prefix}{:04X}", r.end)
+                                } else {
+                                    format_label(r.end)
+                                };
+                                if !r.external_calls.contains(&tgt) {
+                                    r.external_calls.push(tgt.clone());
+                                }
+                                r.ops.push(ir::Op::Jmp { target: tgt });
+                            }
+                            for lbl in r.branch_labels.iter().chain(r.external_calls.iter()) {
+                                if let Some(hex) = lbl.strip_prefix("L_")
+                                    && hex.len() == 4
+                                    && let Ok(a) = u16::from_str_radix(hex, 16)
+                                {
+                                    all_referenced_pcs.insert(a);
+                                }
+                            }
+                            banked_routines.push(r)
+                        }
+                        Err(e) => {
+                            lift_failures.push(format!("bank{bank} ${:04X}: {:?}", f.addr, e))
+                        }
+                    }
                 }
             }
-        }
+        } else {
+            for (bank, entries) in bank_entries_by_bank {
+                let view = policy.analysis_view(image.prg, bank)?;
+                let prefix = format!("b{bank}_");
+                let mut bprof = prof.clone();
+                bprof.functions = entries
+                    .iter()
+                    .map(|&a| profile::Function {
+                        addr: a,
+                        name: format!("L_{prefix}{a:04X}"),
+                        note: None,
+                    })
+                    .collect();
+                bprof.jump_tables.clear();
+                bprof.jump_engines.retain(|site| site.bank == Some(bank));
+                let banalyzed = analyze_with_continuation_roots(
+                    &view,
+                    nes_rom_like::Vectors {
+                        nmi: 0,
+                        reset: 0,
+                        irq: 0,
+                    },
+                    &mut bprof,
+                    analysis::AnalysisWindow::SWITCHABLE_16K,
+                    Some(bank),
+                );
+                let mut bfuncs: Vec<analysis::DiscoveredFunction> =
+                    banalyzed.functions.functions.clone();
+                for f in &bfuncs {
+                    consume_entries.push((Some(bank), f.addr));
+                    consume_entries.extend(
+                        f.external_refs
+                            .iter()
+                            .chain(f.internal_labels.iter())
+                            .map(|&pc| (Some(bank), pc)),
+                    );
+                }
+                bfuncs.sort_by_key(|f| f.addr);
+                bfuncs.dedup_by_key(|f| f.addr);
+                if std::env::var("N2S_DEBUG_BANKFUNCS").is_ok() {
+                    for f in &bfuncs {
+                        eprintln!("bank{bank} func ${:04X}-${:04X} {}", f.addr, f.end, f.name);
+                    }
+                }
+                for w in 0..bfuncs.len().saturating_sub(1) {
+                    let next = bfuncs[w + 1].addr;
+                    if bfuncs[w].end > next {
+                        bfuncs[w].end = next;
+                    }
+                }
+                let bank_jump_engine_sites: Vec<ir::JumpEngineSite> = prof
+                    .jump_engines
+                    .iter()
+                    .filter(|site| site.bank == Some(bank))
+                    .map(|site| ir::JumpEngineSite {
+                        caller: site.caller,
+                        targets: site.targets.clone(),
+                        return_target: site.return_target.clone(),
+                        tail_indices: site.tail_indices.clone(),
+                        stack_return_bytes: site.stack_return_bytes,
+                        target_entry_a: site.target_entry_a.clone(),
+                    })
+                    .collect();
+                let bank_return_escape_sites: Vec<ir::ReturnEscapeSite> = prof
+                    .return_escapes
+                    .iter()
+                    .filter(|site| site.bank == Some(bank))
+                    .map(|site| ir::ReturnEscapeSite {
+                        caller: site.caller,
+                        target: site.target,
+                        return_addr: site.return_addr,
+                        stack_bytes_already_consumed: site.stack_bytes_already_consumed,
+                        consume_at: site.consume_at,
+                    })
+                    .collect();
+                // Interior-alias pass (mirrors the main funcs' two-pass):
+                // collect every referenced window pc, then re-lift with
+                // extra labels so cross-routine branch targets resolve.
+                let mut bank_referenced: std::collections::HashSet<u16> = Default::default();
+                for f in &bfuncs {
+                    let opts = ir::LiftOptions {
+                        start: f.addr,
+                        end: f.end,
+                        entry_name: String::new(),
+                        jump_engine_sites: bank_jump_engine_sites.clone(),
+                        return_escape_sites: bank_return_escape_sites.clone(),
+                        return_consume_sites: return_consume_sites(&prof, Some(bank)),
+                        materialized_call_sites: materialized_call_sites(&prof, Some(bank)),
+                        window_label_prefix: (f.addr < 0xC000).then(|| prefix.clone()),
+                        extra_label_pcs: Vec::new(),
+                    };
+                    if let Ok(r) = ir::lift_range(&view, &opts) {
+                        for lbl in r.branch_labels.iter().chain(r.external_calls.iter()) {
+                            if let Some(hex) = lbl
+                                .strip_prefix(&format!("L_{prefix}"))
+                                .or_else(|| lbl.strip_prefix("L_"))
+                                && hex.len() == 4
+                                && let Ok(a) = u16::from_str_radix(hex, 16)
+                            {
+                                bank_referenced.insert(a);
+                            }
+                        }
+                    }
+                }
+                for f in &bfuncs {
+                    let in_window = f.addr < 0xC000;
+                    let extras: Vec<u16> = bank_referenced
+                        .iter()
+                        .filter(|&&pc| pc > f.addr && pc < f.end)
+                        .copied()
+                        .collect();
+                    let opts = ir::LiftOptions {
+                        start: f.addr,
+                        end: f.end,
+                        entry_name: if in_window {
+                            format!("L_{prefix}{:04X}", f.addr)
+                        } else {
+                            format_label(f.addr)
+                        },
+                        jump_engine_sites: bank_jump_engine_sites.clone(),
+                        return_escape_sites: bank_return_escape_sites.clone(),
+                        return_consume_sites: return_consume_sites(&prof, Some(bank)),
+                        materialized_call_sites: materialized_call_sites(&prof, Some(bank)),
+                        window_label_prefix: in_window.then(|| prefix.clone()),
+                        extra_label_pcs: extras,
+                    };
+                    match ir::lift_range(&view, &opts) {
+                        Ok(mut r) => {
+                            ir::mark_rts_dispatch(&mut r.ops);
+                            let has_terminator =
+                                r.ops.last().is_some_and(ir::Op::is_hard_terminator);
+                            if !has_terminator {
+                                // Trimmed fallthrough: continue into the next
+                                // routine via an explicit jump (bank-prefixed
+                                // when the target is in the window).
+                                let tgt = if r.end < 0xC000 {
+                                    format!("L_{prefix}{:04X}", r.end)
+                                } else {
+                                    format_label(r.end)
+                                };
+                                if !r.external_calls.contains(&tgt) {
+                                    r.external_calls.push(tgt.clone());
+                                }
+                                r.ops.push(ir::Op::Jmp { target: tgt });
+                            }
+                            for lbl in r.branch_labels.iter().chain(r.external_calls.iter()) {
+                                if let Some(hex) = lbl.strip_prefix("L_")
+                                    && hex.len() == 4
+                                    && let Ok(a) = u16::from_str_radix(hex, 16)
+                                {
+                                    all_referenced_pcs.insert(a);
+                                }
+                            }
+                            banked_routines.push(r)
+                        }
+                        Err(e) => {
+                            lift_failures.push(format!("bank{bank} ${:04X}: {:?}", f.addr, e))
+                        }
+                    }
+                }
+            }
+        } // end `else` (UxROM loop) of the MMC3 branch
     }
 
     let mut routines: Vec<ir::Routine> = Vec::with_capacity(funcs.len());
@@ -1473,12 +1978,17 @@ pub fn run(args: &Args) -> Result<String, Error> {
             program.label(sym);
             program.ret();
         }
+        // Multiple replacements may share one hook (e.g. temporary
+        // diagnostic noops); declare each hook once to keep WLA-DX happy.
+        let mut decl_hooks: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for rep in &prof.replacements {
             if RUNTIME_SYMBOLS.contains(&rep.runtime_label.as_str()) {
                 continue; // already forward-declared above
             }
-            program.label(&rep.runtime_label);
-            program.ret();
+            if decl_hooks.insert(rep.runtime_label.as_str()) {
+                program.label(&rep.runtime_label);
+                program.ret();
+            }
         }
 
         // External-call stubs: any label still referenced but not defined
@@ -1497,11 +2007,15 @@ pub fn run(args: &Args) -> Result<String, Error> {
                 .strip_prefix("L_")
                 .map(|h| h.rsplit('_').next().unwrap_or(h))
                 .and_then(|h| u16::from_str_radix(h, 16).ok())
-                .filter(|a| (0x8000..0xC000).contains(a) && banked)
+                .filter(|a| (0x8000..0xC000).contains(a) && banked && !mmc3)
             {
-                // Switchable-window target: the correct translation depends
-                // on the bank mapped AT CALL TIME. Route through the
-                // runtime (bank, addr) dispatch table — never hard-bind.
+                // Switchable-window target (UxROM only): the correct
+                // translation depends on the bank mapped AT CALL TIME. Route
+                // through the runtime (bank, addr) dispatch table — never
+                // hard-bind. MMC3 has two independent windows sharing one
+                // live-bank shadow, so no live dispatch exists: unannotated
+                // window calls trap below (fail closed) until a [[bank_call]]
+                // binds them.
                 program.ld_bc_imm(addr);
                 program.jp("rt_banked_dispatch");
             } else {
@@ -1623,25 +2137,70 @@ pub fn run(args: &Args) -> Result<String, Error> {
     } else {
         image.chr
     };
-    let (chr_4bpp, chr_maps, chr_report) = build_chr_assets(chr_source, &prof.chr_packs)?;
+    let (chr_4bpp, chr_maps, chr_report) = if mmc3 {
+        // MMC3 data_chr is the power-on visible set (first 8 KiB CHR):
+        // boot uploads it and the variant generator's table-0/1 identity
+        // maps describe it. Runtime switches read per-bank group assets.
+        build_chr_assets(&chr_source[..chr_source.len().min(8192)], &prof.chr_packs)?
+    } else {
+        build_chr_assets(chr_source, &prof.chr_packs)?
+    };
     let palette: [u8; 32] = default_palette();
     // Default name table: all zeros. Real rendering comes from translated
     // PPU $2006/$2007 writes during init/NMI. (Switch this to a tile-
     // index pattern for visual verification of the CHR-upload path.)
-    let nametable = Some(vec![0u8; 32 * 28 * 2]);
+    // MMC3 builds have no static nametable: every cell is built at runtime,
+    // and boot skips the upload when DATA_NAMETABLE is undefined.
+    let nametable = if mmc3 {
+        None
+    } else {
+        Some(vec![0u8; 32 * 28 * 2])
+    };
     // Mirror the lower PRG window into a dedicated SMS slot-2 bank. The
     // translated SMB code reads data tables such as $805A/$806D/$8080 via raw
     // slot-2 addresses; without this bank those reads hit CHR/nametable assets.
     // Banked mappers (M1): every switchable 16 KiB NES bank becomes its
     // own SMS data bank; the fixed LAST bank is prg_high. NROM keeps the
     // flat low/high split.
-    let (prg_low, prg_banks) = if banked {
+    let (prg_low, prg_banks) = if banked && !mmc3 {
         let banks: Vec<Vec<u8>> = (0..policy.bank_count())
             .map(|bank| policy.prg_bank(image.prg, bank).map(|bytes| bytes.to_vec()))
             .collect::<Result<_, _>>()?;
         (None, Some(banks))
     } else {
-        (Some(policy.lower_prg(image.prg).to_vec()), None)
+        (
+            if mmc3 {
+                None
+            } else {
+                Some(policy.lower_prg(image.prg).to_vec())
+            },
+            None,
+        )
+    };
+    // MMC3 data banks: PRG as 16 KiB pairs (halves 2k, 2k+1) and converted
+    // CHR in groups of eight 1 KiB banks. See sms_project MMC3 layout.
+    let (mmc3_prg_pairs, mmc3_chr_groups) = if mmc3 {
+        let halves: u8 = policy.bank_count();
+        let mut pairs = Vec::with_capacity(halves as usize / 2);
+        for k in 0..halves / 2 {
+            let mut pair = policy.prg_bank(image.prg, 2 * k)?.to_vec();
+            pair.extend_from_slice(policy.prg_bank(image.prg, 2 * k + 1)?);
+            pairs.push(pair);
+        }
+        let blobs = assets::mmc3_chr_banks_to_sms_4bpp(image.chr).map_err(|err| {
+            Error::Diagnostic(format!("MMC3 CHR bank conversion failed: {err}"))
+        })?;
+        let mut groups = Vec::with_capacity(blobs.len().div_ceil(8));
+        for chunk in blobs.chunks(8) {
+            let mut group = Vec::with_capacity(0x4000);
+            for blob in chunk {
+                group.extend_from_slice(blob);
+            }
+            groups.push(group);
+        }
+        (Some(pairs), Some(groups))
+    } else {
+        (None, None)
     };
     // Mirror the fixed upper PRG window as well. The translated code can run
     // from generated banks in slot 1, so original fixed-bank data tables such
@@ -1650,12 +2209,18 @@ pub fn run(args: &Args) -> Result<String, Error> {
     // Preserve raw NES CHR bytes for emulated PPUDATA reads. SMB's
     // DrawTitleScreen copies a command stream from PPU pattern-table space
     // ($1EC0+) through $2007; the converted SMS 4bpp tiles are not suitable
-    // for that CPU-visible readback path.
-    let chr_nes = Some(if image.chr.is_empty() {
-        vec![0u8; 8192]
+    // for that CPU-visible readback path. MMC3 ships the power-on set
+    // (first 8 KiB): correct until the first CHR switch; a shadow-aware
+    // pattern reader is follow-up work (traced via tile PPM diffs).
+    let chr_nes = if mmc3 {
+        Some(image.chr[..image.chr.len().min(8192)].to_vec())
     } else {
-        image.chr.to_vec()
-    });
+        Some(if image.chr.is_empty() {
+            vec![0u8; 8192]
+        } else {
+            image.chr.to_vec()
+        })
+    };
 
     let project_assets = ProjectAssets {
         chr_4bpp,
@@ -1663,6 +2228,8 @@ pub fn run(args: &Args) -> Result<String, Error> {
         nametable,
         prg_low,
         prg_banks,
+        mmc3_prg_pairs,
+        mmc3_chr_groups,
         prg_high,
         chr_nes,
         chr_maps: Some(chr_maps),
@@ -1689,17 +2256,25 @@ pub fn run(args: &Args) -> Result<String, Error> {
         // 512 KiB for everything: NROM translated uses banks 4-23;
         // banked carts use translated 4-16 + PRG data 17-24 + assets
         // 25-31 (1 MiB ROMs rendered black on real emulators).
-        rom_kib: 512,
+        // MMC3 needs 1 MiB (translated 4-20, PRG pairs 21-36, CHR groups
+        // 37-52, assets 53+): trace_sms verifies it; real-emulator 1 MiB
+        // support is a known follow-up.
+        rom_kib: if mmc3 { 1024 } else { 512 },
         region: 0x4C,
         title: truncate_title(&prof.rom.name),
         mirroring,
         raw_ciram_backend: RawCiramBackend::SramSlot2,
         mapper: prof.rom.mapper,
-        uxrom_bank_count: policy.is_banked().then_some(policy.bank_count()),
-        uxrom_bus_conflicts: policy.uxrom_bus_conflicts().map(|mode| match mode {
-            nes_rom::UxromBusConflicts::None => sms_project::UxromBusConflicts::None,
-            nes_rom::UxromBusConflicts::And => sms_project::UxromBusConflicts::And,
-        }),
+        uxrom_bank_count: (policy.is_banked() && !mmc3).then_some(policy.bank_count()),
+        uxrom_bus_conflicts: (!mmc3)
+            .then(|| policy.uxrom_bus_conflicts())
+            .flatten()
+            .map(|mode| match mode {
+                nes_rom::UxromBusConflicts::None => sms_project::UxromBusConflicts::None,
+                nes_rom::UxromBusConflicts::And => sms_project::UxromBusConflicts::And,
+            }),
+        mmc3_prg_half_count: mmc3.then_some(policy.bank_count()),
+        mmc3_chr_count: mmc3.then(|| (image.chr.len() / 1024) as u16),
         chr_ram: image.chr.is_empty(),
         input_action: prof.input.mode == profile::InputMode::Action,
         input_pause_start: prof.input.pause_start,
@@ -2365,6 +2940,12 @@ const RUNTIME_SYMBOLS: &[&str] = &[
     "rt_controller_read_indexed_x",
     "rt_mapper_write",
     "rt_restore_prg_window",
+    "rt_mmc3_read_window",
+    "rt_mmc3_read_window_indexed",
+    "rt_sram_read",
+    "rt_sram_write",
+    "rt_sram_read_indexed",
+    "rt_sram_write_indexed",
     "rt_banked_dispatch",
     "rt_banked_tail_dispatch",
     "rt_rts_dispatch",

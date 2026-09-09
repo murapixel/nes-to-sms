@@ -186,8 +186,13 @@ pub struct Vectors {
     pub irq: u16,
 }
 
-/// A code entry point inside a switchable PRG window (mapper plan M1):
-/// `addr` is only meaningful with `bank` mapped at $8000-$BFFF.
+/// A code entry point inside a switchable PRG window:
+/// - mapper 2 (UxROM): `addr` is only meaningful with 16 KiB `bank` mapped
+///   at $8000-$BFFF.
+/// - mapper 4 (MMC3): `bank` is an 8 KiB bank index for the window
+///   containing `addr` ($8000-$9FFF via R6, $A000-$BFFF via R7, subject to
+///   the PRG-mode bit — the profile records the physical bank, not the
+///   live R6/R7 state).
 #[derive(Debug, Clone, Deserialize)]
 pub struct BankEntry {
     pub bank: u8,
@@ -196,7 +201,8 @@ pub struct BankEntry {
 
 /// Binds a fixed-bank call TARGET in the switchable window to the bank
 /// the game always has mapped when calling it. Trap diagnostics
-/// ($CB62 shadow at trap time) supply these.
+/// ($CB62 shadow at trap time) supply these. `bank` units follow
+/// `BankEntry` (16 KiB for mapper 2, 8 KiB for mapper 4).
 #[derive(Debug, Clone, Deserialize)]
 pub struct BankCall {
     pub target: u16,
@@ -262,7 +268,9 @@ pub struct JumpEngineSite {
     /// PC of the `JSR JumpEngine` instruction.
     pub caller: u16,
     /// Physical switchable PRG bank containing this call site. Omit for
-    /// NROM or for a mapper-2 call in the fixed `$C000-$FFFF` window.
+    /// NROM or for a banked-mapper call in the fixed `$C000-$FFFF` window.
+    /// Mapper-4 banks are 8 KiB units (see `BankEntry`); the switchable
+    /// range is still `$8000-$BFFF`.
     #[serde(default)]
     pub bank: Option<u8>,
     /// Target labels indexed by the value of A at the JSR (A * 2 into
@@ -307,8 +315,9 @@ pub struct ReturnEscapeSite {
     /// otherwise. No known entry may bypass it into the remaining block.
     #[serde(default)]
     pub consume_at: Option<u16>,
-    /// Physical switchable PRG bank containing this edge. Omit for NROM or a
-    /// mapper-2 edge in the fixed `$C000-$FFFF` window.
+    /// Physical switchable PRG bank containing this edge. Omit for NROM or
+    /// a banked-mapper edge in the fixed `$C000-$FFFF` window. Mapper-4
+    /// banks are 8 KiB units (see `BankEntry`).
     #[serde(default)]
     pub bank: Option<u8>,
 }
@@ -322,6 +331,7 @@ pub struct ReturnConsumeSite {
     /// Original PC of the first PLA; the suffix remains ordinary guest code.
     pub at: u16,
     /// Physical bank of the pair, omitted for fixed-window or NROM code.
+    /// Mapper-4 banks are 8 KiB units (see `BankEntry`).
     #[serde(default)]
     pub bank: Option<u8>,
     pub calls: Vec<MaterializedCallSite>,
@@ -690,14 +700,17 @@ fn validate_return_consumes(p: &Profile) -> Result<(), LoadError> {
         if pc < 0x8000 {
             return Err(invalid("address must be in PRG ROM"));
         }
-        if p.rom.mapper == 2 {
-            if (pc < 0xc000) != bank.is_some()
-                || bank.is_some_and(|b| u32::from(b) >= p.rom.prg_kib / 16)
-            {
+        if p.rom.mapper == 2 || p.rom.mapper == 4 {
+            // Switchable $8000-$BFFF needs a bank, fixed $C000-$FFFF must
+            // not have one. MMC3 windows are 8 KiB (PRG-mode selects which
+            // window R6 drives) but the bank/window split is the same.
+            let bank_units = bank_units_for_mapper(p.rom.mapper, p.rom.prg_kib)
+                .ok_or_else(|| invalid("unsupported banked PRG layout"))?;
+            if (pc < 0xc000) != bank.is_some() || bank.is_some_and(|b| u32::from(b) >= bank_units) {
                 return Err(invalid("physical bank/window mismatch"));
             }
         } else if bank.is_some() {
-            return Err(invalid("bank-qualified sites require mapper 2"));
+            return Err(invalid("bank-qualified sites require mapper 2 or 4"));
         }
         Ok(())
     };
@@ -777,43 +790,82 @@ fn validate_return_consumes(p: &Profile) -> Result<(), LoadError> {
     Ok(())
 }
 
+/// Bank units for a banked mapper's `prg_kib`: 16 KiB banks for mapper 2,
+/// 8 KiB banks for mapper 4. Returns `None` for unbanked/unsupported
+/// mappers or layouts the loader itself would reject.
+fn bank_units_for_mapper(mapper: u16, prg_kib: u32) -> Option<u32> {
+    match mapper {
+        2 if prg_kib > 0 && prg_kib % 16 == 0 && matches!(prg_kib / 16, 2 | 4 | 8 | 16) => {
+            Some(prg_kib / 16)
+        }
+        4 if prg_kib > 0 && prg_kib % 8 == 0 && matches!(prg_kib / 8, 8..=64) => Some(prg_kib / 8),
+        _ => None,
+    }
+}
+
+/// Human bank-unit label for diagnostics ("16-KiB" / "8-KiB").
+fn bank_unit_label(mapper: u16) -> &'static str {
+    if mapper == 4 { "8-KiB" } else { "16-KiB" }
+}
+
 fn validate_bank_annotations(p: &Profile) -> Result<(), LoadError> {
-    if p.rom.mapper != 2 {
+    if p.rom.mapper != 2 && p.rom.mapper != 4 {
         if !p.bank_entries.is_empty()
             || !p.bank_calls.is_empty()
             || p.jump_engines.iter().any(|site| site.bank.is_some())
             || p.return_escapes.iter().any(|site| site.bank.is_some())
         {
             return Err(LoadError::Validation(format!(
-                "bank-qualified annotations require mapper 2, got mapper {}",
+                "bank-qualified annotations require mapper 2 or 4, got mapper {}",
                 p.rom.mapper
             )));
         }
         return Ok(());
     }
 
-    // Keep this layout policy aligned with nes_rom::resolve_mapper_policy:
-    // supported UxROM payloads contain 2, 4, 8, or 16 physical 16-KiB banks.
-    if p.rom.prg_kib == 0 || p.rom.prg_kib % 16 != 0 {
-        return Err(LoadError::Validation(format!(
-            "mapper 2 rom.prg_kib must be a positive multiple of 16 KiB, got {}",
-            p.rom.prg_kib
-        )));
-    }
-    let bank_count = p.rom.prg_kib / 16;
-    if !matches!(bank_count, 2 | 4 | 8 | 16) {
-        return Err(LoadError::Validation(format!(
-            "mapper 2 rom.prg_kib must describe 2, 4, 8, or 16 16-KiB banks, got {} KiB ({bank_count} banks)",
-            p.rom.prg_kib
-        )));
-    }
+    // Keep these layout policies aligned with nes_rom::resolve_mapper_policy:
+    // UxROM payloads hold 2, 4, 8, or 16 physical 16-KiB banks; MMC3
+    // payloads hold 8..=64 physical 8-KiB banks (64..512 KiB).
+    let bank_count = if p.rom.mapper == 2 {
+        if p.rom.prg_kib == 0 || p.rom.prg_kib % 16 != 0 {
+            return Err(LoadError::Validation(format!(
+                "mapper 2 rom.prg_kib must be a positive multiple of 16 KiB, got {}",
+                p.rom.prg_kib
+            )));
+        }
+        let bank_count = p.rom.prg_kib / 16;
+        if !matches!(bank_count, 2 | 4 | 8 | 16) {
+            return Err(LoadError::Validation(format!(
+                "mapper 2 rom.prg_kib must describe 2, 4, 8, or 16 16-KiB banks, got {} KiB ({bank_count} banks)",
+                p.rom.prg_kib
+            )));
+        }
+        bank_count
+    } else {
+        if p.rom.prg_kib == 0 || p.rom.prg_kib % 8 != 0 {
+            return Err(LoadError::Validation(format!(
+                "mapper 4 rom.prg_kib must be a positive multiple of 8 KiB, got {}",
+                p.rom.prg_kib
+            )));
+        }
+        let bank_count = p.rom.prg_kib / 8;
+        if !matches!(bank_count, 8..=64) {
+            return Err(LoadError::Validation(format!(
+                "mapper 4 rom.prg_kib must describe 8..=64 8-KiB banks, got {} KiB ({bank_count} banks)",
+                p.rom.prg_kib
+            )));
+        }
+        bank_count
+    };
+    let unit = bank_unit_label(p.rom.mapper);
+    let mapper = p.rom.mapper;
 
     let mut entries = BTreeMap::new();
     for entry in &p.bank_entries {
         validate_switchable_address("bank_entry.addr", entry.addr)?;
         if u32::from(entry.bank) >= bank_count {
             return Err(LoadError::Validation(format!(
-                "bank_entry bank {} is out of range for {bank_count} mapper 2 banks",
+                "bank_entry bank {} is out of range for {bank_count} mapper {mapper} banks ({unit})",
                 entry.bank
             )));
         }
@@ -830,7 +882,7 @@ fn validate_bank_annotations(p: &Profile) -> Result<(), LoadError> {
         validate_switchable_address("bank_call.target", call.target)?;
         if u32::from(call.bank) >= bank_count {
             return Err(LoadError::Validation(format!(
-                "bank_call bank {} is out of range for {bank_count} mapper 2 banks",
+                "bank_call bank {} is out of range for {bank_count} mapper {mapper} banks ({unit})",
                 call.bank
             )));
         }
@@ -846,12 +898,12 @@ fn validate_bank_annotations(p: &Profile) -> Result<(), LoadError> {
             validate_switchable_address("jump_engine.caller", site.caller)?;
             if u32::from(bank) >= bank_count {
                 return Err(LoadError::Validation(format!(
-                    "jump_engine bank {bank} is out of range for {bank_count} mapper 2 banks"
+                    "jump_engine bank {bank} is out of range for {bank_count} mapper {mapper} banks ({unit})"
                 )));
             }
         } else if site.caller < 0xC000 {
             return Err(LoadError::Validation(format!(
-                "mapper 2 jump_engine caller ${:04X} in the switchable window requires bank",
+                "mapper {mapper} jump_engine caller ${:04X} in the switchable window requires bank",
                 site.caller
             )));
         }
@@ -861,12 +913,12 @@ fn validate_bank_annotations(p: &Profile) -> Result<(), LoadError> {
             validate_switchable_address("return_escape.caller", site.caller)?;
             if u32::from(bank) >= bank_count {
                 return Err(LoadError::Validation(format!(
-                    "return_escape bank {bank} is out of range for {bank_count} mapper 2 banks"
+                    "return_escape bank {bank} is out of range for {bank_count} mapper {mapper} banks ({unit})"
                 )));
             }
         } else if site.caller < 0xC000 {
             return Err(LoadError::Validation(format!(
-                "mapper 2 return_escape caller ${:04X} in the switchable window requires bank",
+                "mapper {mapper} return_escape caller ${:04X} in the switchable window requires bank",
                 site.caller
             )));
         }
@@ -1406,7 +1458,53 @@ targets = ["B"]
             "[rom]\nname = \"x\"\nmapper = 0\nprg_kib = 32\nchr_kib = 8\n\n[[bank_entry]]\nbank = 0\naddr = 0x8000",
         )
         .expect_err("non-mapper bank annotation");
-        assert!(err.to_string().contains("require mapper 2, got mapper 0"));
+        assert!(
+            err.to_string()
+                .contains("require mapper 2 or 4, got mapper 0")
+        );
+    }
+
+    #[test]
+    fn mmc3_bank_annotations_use_8k_units() {
+        // 256 KiB PRG = 32 8 KiB banks: bank 31 is valid, 32 is not.
+        let base = "[rom]\nname = \"x\"\nmapper = 4\nprg_kib = 256\nchr_kib = 128\n";
+        let profile = load_from_str(&format!(
+            "{base}\n[[bank_entry]]\nbank = 31\naddr = 0x8000\n[[bank_entry]]\nbank = 0\naddr = 0xA000\n[[bank_call]]\nbank = 7\ntarget = 0x9FFF"
+        ))
+        .expect("valid MMC3 8 KiB bank annotations");
+        assert_eq!(profile.bank_entries.len(), 2);
+        assert_eq!(profile.bank_calls.len(), 1);
+
+        let err = load_from_str(&format!("{base}\n[[bank_entry]]\nbank = 32\naddr = 0x8000"))
+            .expect_err("MMC3 bank out of range");
+        assert!(
+            err.to_string()
+                .contains("bank_entry bank 32 is out of range for 32 mapper 4 banks (8-KiB)"),
+            "{err}"
+        );
+
+        // Window rule still holds: fixed-window sites need no bank, and a
+        // switchable-window site without one fails closed.
+        let err = load_from_str(&format!(
+            "{base}\n[[jump_engine]]\ncaller = 0x9000\ntargets = [\"A\"]"
+        ))
+        .expect_err("MMC3 window jump engine needs bank");
+        assert!(err.to_string().contains("requires bank"), "{err}");
+        load_from_str(&format!(
+            "{base}\n[[jump_engine]]\ncaller = 0x9000\nbank = 5\ntargets = [\"A\"]"
+        ))
+        .expect("bank-qualified MMC3 window jump engine");
+    }
+
+    #[test]
+    fn rejects_unsupported_mapper_4_prg_layout() {
+        // 48 KiB is 8 KiB-aligned but only 6 banks (< 8 minimum).
+        let err = load_from_str("[rom]\nname = \"x\"\nmapper = 4\nprg_kib = 48\nchr_kib = 16")
+            .expect_err("unsupported mapper 4 layout");
+        assert!(
+            err.to_string().contains("must describe 8..=64 8-KiB banks"),
+            "{err}"
+        );
     }
 
     #[test]

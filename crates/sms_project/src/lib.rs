@@ -22,6 +22,14 @@ pub struct ProjectAssets {
     /// Banked mappers (M1+): each switchable 16 KiB NES PRG bank as its
     /// own SMS data bank ($8000-$BFFF window contents per NES bank).
     pub prg_banks: Option<Vec<Vec<u8>>>,
+    /// MMC3 (mapper 4): PRG in 16 KiB pair banks, each holding two
+    /// consecutive 8 KiB halves (pair `k` = halves `2k, 2k+1`). The runtime
+    /// maps pair `half >> 1` and reads at `(half & 1) * $2000`.
+    pub mmc3_prg_pairs: Option<Vec<Vec<u8>>>,
+    /// MMC3 (mapper 4): converted CHR in groups of eight 1 KiB banks (each
+    /// 1 KiB NES bank converts to 2 KiB SMS 4bpp, so each group is a full
+    /// 16 KiB SMS bank). Group `g` tile `t` lives at `g:$0800*(t/64)+32*(t%64)`.
+    pub mmc3_chr_groups: Option<Vec<Vec<u8>>>,
     /// Optional upper/fixed NES PRG window ($C000-$FFFF) mirrored into SMS slot 2
     /// for runtime-assisted reads of fixed-bank data tables.
     pub prg_high: Option<Vec<u8>>,
@@ -58,6 +66,13 @@ pub enum UxromBusConflicts {
 // the image at 512 KiB matters: 1 MiB Sega-mapper support is spotty in both
 // GPGX and Mednafen.
 pub const NES_PRG_BANK_BASE: u32 = 21;
+// MMC3 layout (1 MiB image; trace_sms verifies it — real-emulator 1 MiB
+// support is a known follow-up): translated code still 4-20, PRG pair
+// banks at MMC3_PRG_BASE (16 pairs = 32 halves for 256 KiB PRG), converted
+// CHR groups at MMC3_CHR_BASE (16 groups of 8 KiB = 128 KiB CHR), small
+// assets above. A 256 KiB / 128 KiB cart needs banks 21-52 + 53-54.
+pub const MMC3_PRG_BASE: u32 = 21;
+pub const MMC3_CHR_BASE: u32 = 37;
 
 const PACKED_PALETTE_OFFSET: u32 = 0x0000;
 const PACKED_NAMETABLE_OFFSET: u32 = 0x0020;
@@ -80,6 +95,12 @@ pub struct ProjectConfig<'a> {
     pub mapper: u16,
     /// Mapper 2 bank count, validated against the emitted PRG bank assets.
     pub uxrom_bank_count: Option<u8>,
+    /// MMC3 (mapper 4) PRG half count (8 KiB units: `pairs.len() * 2`),
+    /// validated against the emitted pair assets.
+    pub mmc3_prg_half_count: Option<u8>,
+    /// MMC3 (mapper 4) CHR 1 KiB bank count (`groups.len() * 8`),
+    /// validated against the emitted group assets. u16: up to 256 banks.
+    pub mmc3_chr_count: Option<u16>,
     /// Mapper 2 bus-conflict mode.
     pub uxrom_bus_conflicts: Option<UxromBusConflicts>,
     /// CHR-RAM cart: patterns upload at runtime; variant regeneration
@@ -110,6 +131,7 @@ pub enum EmitError {
     InvalidTitle(String),
     InvalidRomSize(u32),
     InvalidUxromConfig(String),
+    InvalidMmc3Config(String),
     ReservedBankPlacement { bank: u32, reserved_bank: u32 },
     LayoutExceedsRomCapacity { required_bank: u32, bank_count: u32 },
 }
@@ -126,6 +148,9 @@ impl fmt::Display for EmitError {
             }
             EmitError::InvalidUxromConfig(reason) => {
                 write!(f, "invalid UxROM configuration: {reason}")
+            }
+            EmitError::InvalidMmc3Config(reason) => {
+                write!(f, "invalid MMC3 configuration: {reason}")
             }
             EmitError::ReservedBankPlacement {
                 bank,
@@ -179,6 +204,71 @@ fn validate_config(
             "PRG bank assets require mapper 2".into(),
         ));
     }
+    if (assets.mmc3_prg_pairs.is_some() || assets.mmc3_chr_groups.is_some()) && cfg.mapper != 4 {
+        return Err(EmitError::InvalidMmc3Config(
+            "MMC3 PRG/CHR assets require mapper 4".into(),
+        ));
+    }
+    if cfg.mapper == 4 {
+        let halves = cfg
+            .mmc3_prg_half_count
+            .ok_or_else(|| EmitError::InvalidMmc3Config("missing MMC3 PRG half count".into()))?;
+        // 8 KiB halves in pairs: 8..=64 halves, even. Power-of-two is
+        // required: the runtime masks (`& count-1`) instead of dividing.
+        if halves < 8 || halves > 64 || halves % 2 != 0 || !halves.is_power_of_two() {
+            return Err(EmitError::InvalidMmc3Config(format!(
+                "PRG half count must be an even power of two in 8..=64, got {halves}"
+            )));
+        }
+        let pairs = assets
+            .mmc3_prg_pairs
+            .as_ref()
+            .ok_or_else(|| EmitError::InvalidMmc3Config("missing MMC3 PRG pair assets".into()))?;
+        if pairs.len() * 2 != halves as usize {
+            return Err(EmitError::InvalidMmc3Config(
+                "PRG pair assets do not match configured half count".into(),
+            ));
+        }
+        if pairs.iter().any(|p| p.len() != 0x4000) {
+            return Err(EmitError::InvalidMmc3Config(
+                "each PRG pair must be exactly 16 KiB".into(),
+            ));
+        }
+        let chr_1k = cfg
+            .mmc3_chr_count
+            .ok_or_else(|| EmitError::InvalidMmc3Config("missing MMC3 CHR count".into()))?;
+        let groups = assets
+            .mmc3_chr_groups
+            .as_ref()
+            .ok_or_else(|| EmitError::InvalidMmc3Config("missing MMC3 CHR group assets".into()))?;
+        if groups.len() * 8 != chr_1k as usize {
+            return Err(EmitError::InvalidMmc3Config(
+                "CHR group assets do not match configured CHR count".into(),
+            ));
+        }
+        if chr_1k == 0 || !chr_1k.is_power_of_two() {
+            return Err(EmitError::InvalidMmc3Config(format!(
+                "CHR count must be a power of two (runtime masks), got {chr_1k}"
+            )));
+        }
+        if groups.iter().any(|g| g.len() != 0x4000) {
+            return Err(EmitError::InvalidMmc3Config(
+                "each CHR group must be exactly 16 KiB".into(),
+            ));
+        }
+        // Fixed-high image must be the final pair (halves N-2, N-1): the
+        // runtime maps it whole for every $C000-$FFFF read (mode 0).
+        let last_pair = &pairs[pairs.len() - 1];
+        if assets.prg_high.as_deref() != Some(last_pair.as_slice()) {
+            return Err(EmitError::InvalidMmc3Config(
+                "fixed PRG asset must match the final MMC3 pair".into(),
+            ));
+        }
+    } else if cfg.mmc3_prg_half_count.is_some() || cfg.mmc3_chr_count.is_some() {
+        return Err(EmitError::InvalidMmc3Config(
+            "MMC3 settings supplied for a non-MMC3 mapper".into(),
+        ));
+    }
     if cfg.mapper == 2 {
         let count = cfg
             .uxrom_bank_count
@@ -209,7 +299,7 @@ fn validate_config(
         .filter_map(|line| line.trim_start().strip_prefix(".bank "))
         .filter_map(|tail| tail.split_whitespace().next()?.parse::<u32>().ok())
         .collect();
-    let reserved_bank = if assets.prg_banks.is_some() {
+    let reserved_bank = if assets.prg_banks.is_some() || assets.mmc3_prg_pairs.is_some() {
         NES_PRG_BANK_BASE
     } else {
         24
@@ -224,6 +314,11 @@ fn validate_config(
     let asset_base = if let Some(banks) = &assets.prg_banks {
         required_bank = required_bank.max(NES_PRG_BANK_BASE + banks.len() as u32 - 1);
         NES_PRG_BANK_BASE + banks.len() as u32
+    } else if let Some(groups) = &assets.mmc3_chr_groups {
+        let pairs = assets.mmc3_prg_pairs.as_ref().map(Vec::len).unwrap_or(0) as u32;
+        required_bank = required_bank.max(MMC3_PRG_BASE + pairs.saturating_sub(1).max(0));
+        required_bank = required_bank.max(MMC3_CHR_BASE + groups.len() as u32 - 1);
+        MMC3_CHR_BASE + groups.len() as u32
     } else {
         24
     };
@@ -396,6 +491,8 @@ fn sms_asm_content(
                 .as_ref()
                 .map(|b| b.len() as u32)
                 .unwrap_or(0)
+    } else if let Some(groups) = &assets.mmc3_chr_groups {
+        MMC3_CHR_BASE + groups.len() as u32
     } else {
         24
     };
@@ -456,6 +553,22 @@ fn sms_asm_content(
             0
         };
         mapper_define.push_str(&format!("\n.define NES_PRG_BUS_CONFLICTS {conflicts}"));
+    }
+    if cfg.mapper == 4 {
+        // MMC3 data layout (see MMC3_PRG_BASE/MMC3_CHR_BASE): PRG pairs at
+        // MMC3_PRG_BASE, converted CHR groups at MMC3_CHR_BASE. Masks assume
+        // power-of-two bank counts, which the profile loader enforces.
+        let halves = cfg.mmc3_prg_half_count.expect("validated MMC3 config");
+        let chr_1k = cfg.mmc3_chr_count.expect("validated MMC3 config");
+        mapper_define.push_str("\n.define NES_MMC3 1");
+        mapper_define.push_str(&format!(
+            "\n.define NES_MMC3_PRG_BASE {MMC3_PRG_BASE}\n.define NES_MMC3_PRG_COUNT {halves}\n.define NES_MMC3_PRG_MASK {}",
+            halves - 1
+        ));
+        mapper_define.push_str(&format!(
+            "\n.define NES_MMC3_CHR_BASE {MMC3_CHR_BASE}\n.define NES_MMC3_CHR_COUNT {chr_1k}\n.define NES_MMC3_CHR_MASK {}",
+            chr_1k - 1
+        ));
     }
     let mirroring_define = match cfg.mirroring {
         NesMirroring::Vertical => ".define NES_MIRRORING_VERTICAL 1",
@@ -530,7 +643,8 @@ fn sms_asm_content(
     );
 
     if has_nametable {
-        let (bank, org) = if assets.prg_banks.is_some() {
+        out.push_str("\n.define DATA_NAMETABLE 1\n");
+        let (bank, org) = if assets.prg_banks.is_some() || assets.mmc3_prg_pairs.is_some() {
             (asset_base + 1, PACKED_NAMETABLE_OFFSET)
         } else {
             (asset_base + 2, 0)
@@ -578,11 +692,51 @@ fn sms_asm_content(
         out.push_str("\n.define data_prg_low data_prg_bank_0\n");
     }
 
+    if let Some(pairs) = &assets.mmc3_prg_pairs {
+        // MMC3: pair k (halves 2k, 2k+1) lives at SMS bank MMC3_PRG_BASE + k,
+        // pinned to slot 2. rt_mmc3_read_window maps the pair holding the
+        // live half; data_prg_high aliases the final pair (fixed halves).
+        for (k, _) in pairs.iter().enumerate() {
+            let bank = MMC3_PRG_BASE + k as u32;
+            out.push_str(&format!(
+                "\n.bank {bank} slot 2\n\
+                 .org $0000\n\
+                 .section \"data_mmc3_prg_{k}\" force\n\
+                 data_mmc3_prg_{k}:\n\
+                 .incbin \"data/mmc3_prg_{k}.bin\"\n\
+                 .ends\n"
+            ));
+        }
+    }
+
+    if let Some(groups) = &assets.mmc3_chr_groups {
+        // MMC3: CHR group g (eight 1 KiB banks -> 2 KiB SMS 4bpp each) at
+        // MMC3_CHR_BASE + g. The variant generator maps the group holding
+        // the live 1 KiB bank.
+        for (g, _) in groups.iter().enumerate() {
+            let bank = MMC3_CHR_BASE + g as u32;
+            out.push_str(&format!(
+                "\n.bank {bank} slot 2\n\
+                 .org $0000\n\
+                 .section \"data_mmc3_chr_{g}\" force\n\
+                 data_mmc3_chr_{g}:\n\
+                 .incbin \"data/mmc3_chr_{g}.bin\"\n\
+                 .ends\n"
+            ));
+        }
+    }
+
     if assets.prg_high.is_some() {
         if let Some(banks) = &assets.prg_banks {
             out.push_str(&format!(
                 "\n.define data_prg_high data_prg_bank_{}\n",
                 banks.len() - 1
+            ));
+        } else if let Some(pairs) = &assets.mmc3_prg_pairs {
+            // Fixed-high image is the final pair (validated byte-identical).
+            out.push_str(&format!(
+                "\n.define data_prg_high data_mmc3_prg_{}\n",
+                pairs.len() - 1
             ));
         } else {
             out.push_str(&format!(
@@ -599,7 +753,8 @@ fn sms_asm_content(
     }
 
     if assets.chr_nes.is_some() {
-        let (bank, org) = if assets.prg_banks.is_some() {
+        let banked = assets.prg_banks.is_some() || assets.mmc3_prg_pairs.is_some();
+        let (bank, org) = if banked {
             (asset_base + 1, PACKED_CHR_NES_OFFSET)
         } else {
             (asset_base + 4, 0)
@@ -616,7 +771,8 @@ fn sms_asm_content(
     }
 
     if assets.chr_maps.is_some() {
-        let (bank, org) = if assets.prg_banks.is_some() {
+        let banked = assets.prg_banks.is_some() || assets.mmc3_prg_pairs.is_some();
+        let (bank, org) = if banked {
             (asset_base + 1, PACKED_CHR_MAPS_OFFSET)
         } else {
             (asset_base + 5, 0)
@@ -670,6 +826,16 @@ fn emit_data_files(
     if let Some(banks) = &assets.prg_banks {
         for (k, b) in banks.iter().enumerate() {
             fs::write(data_dir.join(format!("prg_bank_{k}.bin")), b)?;
+        }
+    }
+    if let Some(pairs) = &assets.mmc3_prg_pairs {
+        for (k, b) in pairs.iter().enumerate() {
+            fs::write(data_dir.join(format!("mmc3_prg_{k}.bin")), b)?;
+        }
+    }
+    if let Some(groups) = &assets.mmc3_chr_groups {
+        for (g, b) in groups.iter().enumerate() {
+            fs::write(data_dir.join(format!("mmc3_chr_{g}.bin")), b)?;
         }
     }
     if let Some(chr_nes) = &assets.chr_nes {
@@ -772,6 +938,8 @@ mod tests {
             nametable: None,
             prg_low: None,
             prg_high: None,
+            mmc3_prg_pairs: None,
+            mmc3_chr_groups: None,
             chr_nes: None,
             chr_maps: None,
         }
@@ -782,6 +950,8 @@ mod tests {
             mapper: 0,
             uxrom_bank_count: None,
             uxrom_bus_conflicts: None,
+            mmc3_prg_half_count: None,
+            mmc3_chr_count: None,
             chr_ram: false,
             input_action: false,
             input_pause_start: false,
@@ -931,6 +1101,8 @@ mod tests {
             nametable: Some(vec![0u8; 1792]),
             prg_low: None,
             prg_high: None,
+            mmc3_prg_pairs: None,
+            mmc3_chr_groups: None,
             chr_nes: None,
             chr_maps: None,
         };
@@ -971,6 +1143,8 @@ mod tests {
             mapper: 0,
             uxrom_bank_count: None,
             uxrom_bus_conflicts: None,
+            mmc3_prg_half_count: None,
+            mmc3_chr_count: None,
             chr_ram: false,
             input_action: false,
             input_pause_start: false,
@@ -1003,6 +1177,8 @@ mod tests {
             mapper: 0,
             uxrom_bank_count: None,
             uxrom_bus_conflicts: None,
+            mmc3_prg_half_count: None,
+            mmc3_chr_count: None,
             chr_ram: false,
             input_action: false,
             input_pause_start: false,
@@ -1035,6 +1211,8 @@ mod tests {
             mapper: 0,
             uxrom_bank_count: None,
             uxrom_bus_conflicts: None,
+            mmc3_prg_half_count: None,
+            mmc3_chr_count: None,
             chr_ram: false,
             input_action: false,
             input_pause_start: false,
@@ -1112,6 +1290,8 @@ mod tests {
             mapper: 0,
             uxrom_bank_count: None,
             uxrom_bus_conflicts: None,
+            mmc3_prg_half_count: None,
+            mmc3_chr_count: None,
             chr_ram: false,
             input_action: false,
             input_pause_start: false,
@@ -1167,6 +1347,8 @@ mod tests {
             mapper: 0,
             uxrom_bank_count: None,
             uxrom_bus_conflicts: None,
+            mmc3_prg_half_count: None,
+            mmc3_chr_count: None,
             chr_ram: false,
             input_action: false,
             input_pause_start: false,
@@ -1223,6 +1405,8 @@ mod tests {
             mapper: 0,
             uxrom_bank_count: None,
             uxrom_bus_conflicts: None,
+            mmc3_prg_half_count: None,
+            mmc3_chr_count: None,
             chr_ram: false,
             input_action: false,
             input_pause_start: false,
@@ -1258,6 +1442,8 @@ mod tests {
             mapper: 0,
             uxrom_bank_count: None,
             uxrom_bus_conflicts: None,
+            mmc3_prg_half_count: None,
+            mmc3_chr_count: None,
             chr_ram: false,
             input_action: false,
             input_pause_start: false,

@@ -9,6 +9,12 @@ use sha2::{Digest, Sha256};
 pub const INES_MAGIC: [u8; 4] = [b'N', b'E', b'S', 0x1a];
 pub const PRG_BANK_SIZE: usize = 16 * 1024;
 pub const CHR_BANK_SIZE: usize = 8 * 1024;
+/// MMC3 PRG banking granularity: two switchable 8 KiB windows plus a fixed
+/// 16 KiB top (see `MapperPolicy::Mmc3`).
+pub const MMC3_PRG_WINDOW_SIZE: usize = 8 * 1024;
+/// Smallest MMC3 PRG payload (8 x 8 KiB banks); largest is 64 x 8 KiB.
+pub const MMC3_MIN_8K_BANKS: usize = 8;
+pub const MMC3_MAX_8K_BANKS: usize = 64;
 pub const TRAINER_SIZE: usize = 512;
 pub const HEADER_SIZE: usize = 16;
 
@@ -211,6 +217,12 @@ pub enum MapperPolicy {
         bank_count: u8,
         bus_conflicts: UxromBusConflicts,
     },
+    /// Mapper 4 (MMC3): two switchable 8 KiB PRG windows plus a fixed 16 KiB
+    /// top. `prg_8k_count` is the number of 8 KiB PRG banks (8..=64).
+    /// Live window contents additionally depend on the R6/R7 registers and
+    /// the PRG-mode bit; see `Mmc3State`. Code that only has a single UxROM
+    /// `selected_bank` must treat `$8000-$BFFF` as unknown (fail closed).
+    Mmc3 { prg_8k_count: u8 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -221,12 +233,33 @@ pub enum UxromBusConflicts {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MapperPolicyError {
-    UnsupportedMapper { mapper: u16 },
+    UnsupportedMapper {
+        mapper: u16,
+    },
     UxromRequiresNes2,
-    UnsupportedUxromSubmapper { submapper: u8 },
-    InvalidNromPrgLayout { prg_len: usize },
-    InvalidUxromPrgLayout { prg_len: usize },
-    SelectedBankOutOfRange { bank: u8, bank_count: u8 },
+    UnsupportedUxromSubmapper {
+        submapper: u8,
+    },
+    InvalidNromPrgLayout {
+        prg_len: usize,
+    },
+    InvalidUxromPrgLayout {
+        prg_len: usize,
+    },
+    SelectedBankOutOfRange {
+        bank: u8,
+        bank_count: u8,
+    },
+    InvalidMmc3PrgLayout {
+        prg_len: usize,
+    },
+    SelectedMmc3BankOutOfRange {
+        bank: u8,
+        bank_count: u8,
+    },
+    /// MMC3 reads/writes that need live ($8000-select, $8001-data, PRG-mode)
+    /// window state instead of a single UxROM-style selected bank.
+    Mmc3WindowStateRequired,
 }
 
 impl fmt::Display for MapperPolicyError {
@@ -235,7 +268,7 @@ impl fmt::Display for MapperPolicyError {
             Self::UnsupportedMapper { mapper } => {
                 write!(
                     f,
-                    "unsupported mapper {mapper}; only mapper 0 (NROM) and mapper 2 (UxROM) are supported"
+                    "unsupported mapper {mapper}; only mapper 0 (NROM), mapper 2 (UxROM) and mapper 4 (MMC3 loader) are supported"
                 )
             }
             Self::UxromRequiresNes2 => {
@@ -256,6 +289,18 @@ impl fmt::Display for MapperPolicyError {
             Self::SelectedBankOutOfRange { bank, bank_count } => write!(
                 f,
                 "UxROM selected bank {bank} is out of range for {bank_count} banks"
+            ),
+            Self::InvalidMmc3PrgLayout { prg_len } => write!(
+                f,
+                "invalid MMC3 PRG layout: expected 8 KiB-aligned 64..512 KiB, got {prg_len} bytes"
+            ),
+            Self::SelectedMmc3BankOutOfRange { bank, bank_count } => write!(
+                f,
+                "MMC3 selected bank {bank} is out of range for {bank_count} 8 KiB banks"
+            ),
+            Self::Mmc3WindowStateRequired => write!(
+                f,
+                "MMC3 window needs live R6/R7 + PRG-mode state; a single UxROM-style bank is not enough"
             ),
         }
     }
@@ -293,19 +338,42 @@ pub fn resolve_mapper_policy(
             }
         }
         2 => Err(MapperPolicyError::InvalidUxromPrgLayout { prg_len }),
+        4 if prg_len.is_multiple_of(MMC3_PRG_WINDOW_SIZE) => {
+            let banks_8k = prg_len / MMC3_PRG_WINDOW_SIZE;
+            if (MMC3_MIN_8K_BANKS..=MMC3_MAX_8K_BANKS).contains(&banks_8k) {
+                Ok(MapperPolicy::Mmc3 {
+                    prg_8k_count: banks_8k as u8,
+                })
+            } else {
+                Err(MapperPolicyError::InvalidMmc3PrgLayout { prg_len })
+            }
+        }
+        4 => Err(MapperPolicyError::InvalidMmc3PrgLayout { prg_len }),
         mapper => Err(MapperPolicyError::UnsupportedMapper { mapper }),
     }
 }
 
 impl MapperPolicy {
     pub fn is_banked(self) -> bool {
-        matches!(self, Self::Uxrom { .. })
+        matches!(self, Self::Uxrom { .. } | Self::Mmc3 { .. })
     }
 
+    /// Bank count in this policy's native units: 16 KiB banks for UxROM,
+    /// 8 KiB banks for MMC3, 16 KiB units for NROM. Callers that iterate
+    /// 16 KiB `prg_bank` windows must reject `Mmc3` explicitly first.
     pub fn bank_count(self) -> u8 {
         match self {
             Self::Nrom { prg_len } => (prg_len / PRG_BANK_SIZE) as u8,
             Self::Uxrom { bank_count, .. } => bank_count,
+            Self::Mmc3 { prg_8k_count } => prg_8k_count,
+        }
+    }
+
+    /// Number of 8 KiB PRG banks, if this is an MMC3 policy.
+    pub fn mmc3_8k_bank_count(self) -> Option<u8> {
+        match self {
+            Self::Mmc3 { prg_8k_count } => Some(prg_8k_count),
+            _ => None,
         }
     }
 
@@ -318,10 +386,18 @@ impl MapperPolicy {
             Self::Uxrom { bank_count, .. } => {
                 Err(MapperPolicyError::SelectedBankOutOfRange { bank, bank_count })
             }
+            Self::Mmc3 { prg_8k_count } if bank < prg_8k_count => {
+                Ok(bank as usize * MMC3_PRG_WINDOW_SIZE)
+            }
+            Self::Mmc3 {
+                prg_8k_count: bank_count,
+            } => Err(MapperPolicyError::SelectedMmc3BankOutOfRange { bank, bank_count }),
         }
     }
 
     /// Map a CPU address using the UxROM lower-window selection when needed.
+    /// For MMC3 only the fixed `$C000-$FFFF` top is mappable with a bare
+    /// bank index; `$8000-$BFFF` needs `Mmc3State` and returns `Ok(None)`.
     pub fn cpu_to_prg_offset(
         self,
         cpu_addr: u16,
@@ -349,16 +425,46 @@ impl MapperPolicy {
                     ))
                 }
             }
+            Self::Mmc3 { prg_8k_count } => {
+                // Validate the bare index so vector reads fail closed, but the
+                // switchable windows still need live R6/R7 + PRG-mode state.
+                if selected_bank >= prg_8k_count {
+                    return Err(MapperPolicyError::SelectedMmc3BankOutOfRange {
+                        bank: selected_bank,
+                        bank_count: prg_8k_count,
+                    });
+                }
+                if cpu_addr < 0xC000 {
+                    Ok(None)
+                } else {
+                    let prg_len = prg_8k_count as usize * MMC3_PRG_WINDOW_SIZE;
+                    Ok(Some(prg_len - 0x4000 + (cpu_addr as usize - 0xC000)))
+                }
+            }
         }
     }
 
-    /// Return the requested UxROM switchable bank.
+    /// Return the requested switchable bank: 16 KiB for UxROM, 8 KiB for MMC3.
     pub fn prg_bank<'a>(self, prg: &'a [u8], bank: u8) -> Result<&'a [u8], MapperPolicyError> {
         let offset = self.checked_bank_offset(bank)?;
-        Ok(&prg[offset..offset + PRG_BANK_SIZE])
+        let len = match self {
+            Self::Mmc3 { .. } => MMC3_PRG_WINDOW_SIZE,
+            _ => PRG_BANK_SIZE,
+        };
+        prg.get(offset..offset + len).ok_or(match self {
+            Self::Mmc3 {
+                prg_8k_count: bank_count,
+            } => MapperPolicyError::SelectedMmc3BankOutOfRange { bank, bank_count },
+            Self::Uxrom { bank_count, .. } => {
+                MapperPolicyError::SelectedBankOutOfRange { bank, bank_count }
+            }
+            Self::Nrom { prg_len } => MapperPolicyError::InvalidNromPrgLayout { prg_len },
+        })
     }
 
-    /// Return the PRG bytes visible in the fixed $C000-$FFFF window.
+    /// Return the PRG bytes visible in the fixed `$C000-$FFFF` window.
+    /// For MMC3 this is the last 16 KiB (two 8 KiB banks), matching the
+    /// hardware's fixed top regardless of PRG-mode.
     pub fn fixed_prg<'a>(self, prg: &'a [u8]) -> &'a [u8] {
         match self {
             Self::Nrom { prg_len } if prg_len == PRG_BANK_SIZE => prg,
@@ -366,6 +472,10 @@ impl MapperPolicy {
             Self::Uxrom { bank_count, .. } => {
                 let offset = (bank_count as usize - 1) * PRG_BANK_SIZE;
                 &prg[offset..offset + PRG_BANK_SIZE]
+            }
+            Self::Mmc3 { prg_8k_count } => {
+                let prg_len = prg_8k_count as usize * MMC3_PRG_WINDOW_SIZE;
+                &prg[prg_len - 2 * MMC3_PRG_WINDOW_SIZE..]
             }
         }
     }
@@ -376,6 +486,8 @@ impl MapperPolicy {
     }
 
     /// Construct the NROM-shaped analysis view for a selected UxROM bank.
+    /// MMC3 needs live R6/R7 + PRG-mode window state, so this fails closed
+    /// with `Mmc3WindowStateRequired` instead of guessing a window.
     pub fn analysis_view(
         self,
         prg: &[u8],
@@ -389,6 +501,7 @@ impl MapperPolicy {
                 view.extend_from_slice(self.fixed_prg(prg));
                 Ok(view)
             }
+            Self::Mmc3 { .. } => Err(MapperPolicyError::Mmc3WindowStateRequired),
         }
     }
 
@@ -396,10 +509,14 @@ impl MapperPolicy {
         match self {
             Self::Nrom { .. } => None,
             Self::Uxrom { bus_conflicts, .. } => Some(bus_conflicts),
+            Self::Mmc3 { .. } => None,
         }
     }
 
     /// Apply a mapper write with its pre-write ROM bus byte.
+    /// MMC3 uses paired `$8000`-select / `$8001`-data writes plus mode/IRQ
+    /// registers; a single UxROM-style byte is not enough, so this fails
+    /// closed with `Mmc3WindowStateRequired` (use `Mmc3State` instead).
     pub fn selected_bank_from_write(
         self,
         raw_write: u8,
@@ -419,8 +536,336 @@ impl MapperPolicy {
                 self.checked_bank_offset(bank)?;
                 Ok(bank)
             }
+            Self::Mmc3 { .. } => Err(MapperPolicyError::Mmc3WindowStateRequired),
         }
     }
+}
+
+/// Live MMC3 ($8000-$FFFF) register state for PRG windows, mirroring and the
+/// scanline IRQ latch. Pure logic, no ROM bytes: mirrors the NESdev
+/// Programming-MMC3 register map so the reference bus, analysis and runtime
+/// can share one fail-closed model.
+///
+/// Address decode follows the hardware: even addresses in `$8000-$9FFE`
+/// select the bank register, odd addresses write its data; `$A000` even
+/// sets nametable arrangement, odd sets PRG-RAM protect; `$C000` even sets
+/// the IRQ latch, odd reloads; `$E000` even disables IRQs, odd enables them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Mmc3State {
+    /// Last `$8000` value: bit 7 = CHR A12 invert, bit 6 = PRG mode,
+    /// bits 2..=0 = R0-R7 select.
+    pub bank_select: u8,
+    /// R0-R7 bank registers (CHR R0/R1 are 2 KiB units, R2-R5 are 1 KiB,
+    /// PRG R6/R7 are 8 KiB).
+    pub regs: [u8; 8],
+    /// Nametable arrangement from `$A000` bit 0 (false = vertical, true =
+    /// horizontal). Boards with hardwired 4-screen VRAM ignore it.
+    pub horizontal_mirroring: bool,
+    /// PRG-RAM write protect from `$A001`.
+    pub prg_ram_protect: u8,
+    /// IRQ latch from `$C000`.
+    pub irq_latch: u8,
+    /// IRQ enabled by `$E001`, cleared by `$E000` or reset.
+    pub irq_enabled: bool,
+    /// Set by `$C001`; the next A12 clock reloads the counter from the latch.
+    pub irq_reload_pending: bool,
+    /// Down-counter clocked by PPU A12 rises while rendering. MMC3B/C
+    /// semantics (the common silicon; MMC3A differs on latch-0 reload
+    /// timing — noted, not modeled).
+    pub irq_counter: u8,
+    /// Level-asserted while set: the mapper holds IRQ low until the game
+    /// acknowledges with an `$E000` write. Cleared only there (or reset).
+    pub irq_pending: bool,
+}
+
+impl Default for Mmc3State {
+    fn default() -> Self {
+        Self {
+            bank_select: 0,
+            regs: [0, 2, 4, 5, 6, 7, 0, 1],
+            horizontal_mirroring: false,
+            prg_ram_protect: 0,
+            irq_latch: 0,
+            irq_enabled: false,
+            irq_reload_pending: false,
+            irq_counter: 0,
+            irq_pending: false,
+        }
+    }
+}
+
+impl Mmc3State {
+    pub fn prg_mode(self) -> bool {
+        self.bank_select & 0x40 != 0
+    }
+
+    pub fn chr_invert(self) -> bool {
+        self.bank_select & 0x80 != 0
+    }
+
+    pub fn selected_register(self) -> usize {
+        (self.bank_select & 0x07) as usize
+    }
+
+    /// Apply one MMC3 register write. Addresses below `$8000` are not mapper
+    /// writes and leave the state unchanged.
+    pub fn apply_write(&mut self, addr: u16, value: u8) {
+        match addr {
+            0x8000..=0x9FFF if addr & 1 == 0 => self.bank_select = value,
+            0x8000..=0x9FFF => {
+                let reg = self.selected_register();
+                self.regs[reg] = value;
+            }
+            0xA000..=0xBFFF if addr & 1 == 0 => {
+                self.horizontal_mirroring = value & 0x01 != 0;
+            }
+            0xA000..=0xBFFF => self.prg_ram_protect = value,
+            0xC000..=0xDFFF if addr & 1 == 0 => self.irq_latch = value,
+            0xC000..=0xDFFF => self.irq_reload_pending = true,
+            0xE000..=0xFFFF if addr & 1 == 0 => {
+                self.irq_enabled = false;
+                self.irq_reload_pending = false;
+                self.irq_pending = false;
+            }
+            0xE000..=0xFFFF => self.irq_enabled = true,
+            _ => {}
+        }
+    }
+
+    /// 1 KiB CHR bank selected for pattern-table 1 KiB `slot` (0-7) through
+    /// the R0-R5 windows and the CHR-invert bit. R0/R1 are 2 KiB pairs
+    /// (even bank plus the slot offset within the pair); R2-R5 are single
+    /// 1 KiB banks. The caller masks the result into the available CHR
+    /// banks. Shared by the reference bus and the future SMS runtime so
+    /// window resolution never drifts between them.
+    pub fn chr_bank_1k(self, slot_1k: u8) -> u8 {
+        let regs = self.regs;
+        let slot = slot_1k & 7;
+        match (self.chr_invert(), slot) {
+            (false, 0) | (false, 1) => (regs[0] & !1) | (slot & 1),
+            (false, 2) | (false, 3) => (regs[1] & !1) | (slot & 1),
+            (false, 4) => regs[2],
+            (false, 5) => regs[3],
+            (false, 6) => regs[4],
+            (false, 7) => regs[5],
+            (true, 0) => regs[2],
+            (true, 1) => regs[3],
+            (true, 2) => regs[4],
+            (true, 3) => regs[5],
+            (true, 4) | (true, 5) => (regs[0] & !1) | ((slot - 4) & 1),
+            _ => (regs[1] & !1) | ((slot - 6) & 1),
+        }
+    }
+
+    /// One PPU-A12 clock of the scanline IRQ counter (MMC3B/C). When the
+    /// reload flag is set — or the counter already reads zero — the latch
+    /// is reloaded instead of decrementing. The mapper then asserts IRQ
+    /// whenever the counter reads zero and IRQs are enabled; the level
+    /// holds until an `$E000` ack. Callers decide *when* A12 rises (only
+    /// during rendering fetches into `$1000-$1FFF` on hardware); this
+    /// method only advances the counter deterministically.
+    pub fn clock_a12(&mut self) {
+        if self.irq_reload_pending || self.irq_counter == 0 {
+            self.irq_counter = self.irq_latch;
+            self.irq_reload_pending = false;
+        } else {
+            self.irq_counter = self.irq_counter.wrapping_sub(1);
+        }
+        if self.irq_counter == 0 && self.irq_enabled {
+            self.irq_pending = true;
+        }
+    }
+
+    /// 8 KiB PRG bank index visible at `cpu_addr` for a ROM with
+    /// `prg_8k_count` banks. Returns `None` outside `$8000-$FFFF`.
+    pub fn prg_bank_at(self, cpu_addr: u16, prg_8k_count: u8) -> Option<u8> {
+        if cpu_addr < 0x8000 || prg_8k_count == 0 {
+            return None;
+        }
+        let last = prg_8k_count - 1;
+        let second_last = prg_8k_count.wrapping_sub(2);
+        let r6 = self.regs[6] % prg_8k_count;
+        let r7 = self.regs[7] % prg_8k_count;
+        let bank = match cpu_addr {
+            0x8000..=0x9FFF if !self.prg_mode() => r6,
+            0x8000..=0x9FFF => second_last,
+            0xA000..=0xBFFF => r7,
+            0xC000..=0xDFFF if !self.prg_mode() => second_last,
+            0xC000..=0xDFFF => r6,
+            _ => last,
+        };
+        Some(bank)
+    }
+
+    /// CPU address to PRG byte offset using live window state.
+    pub fn cpu_to_prg_offset(
+        self,
+        prg_len: usize,
+        prg_8k_count: u8,
+        cpu_addr: u16,
+    ) -> Option<usize> {
+        let bank = self.prg_bank_at(cpu_addr, prg_8k_count)? as usize;
+        let window_base = match cpu_addr {
+            0x8000..=0x9FFF => 0x8000,
+            0xA000..=0xBFFF => 0xA000,
+            0xC000..=0xDFFF => 0xC000,
+            0xE000..=0xFFFF => 0xE000,
+            _ => return None,
+        };
+        let offset = bank * MMC3_PRG_WINDOW_SIZE + (cpu_addr as usize - window_base);
+        (offset < prg_len).then_some(offset)
+    }
+}
+
+/// MMC3 PRG address window. The live bank in `Low`/`High`/`Mid` depends on
+/// the R6/R7 registers and the PRG-mode bit (`Mmc3State::prg_bank_at`);
+/// only `Top` is unconditionally the last bank. Discovery and the future
+/// bank-constant propagation pass share this classifier so window identity
+/// never drifts between crates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mmc3Window {
+    /// `$8000-$9FFF`: R6 in PRG mode 0, second-last bank in PRG mode 1.
+    Low,
+    /// `$A000-$BFFF`: always R7.
+    High,
+    /// `$C000-$DFFF`: second-last bank in PRG mode 0, R6 in PRG mode 1.
+    Mid,
+    /// `$E000-$FFFF`: always the last bank (vectors live here).
+    Top,
+}
+
+impl Mmc3Window {
+    /// Window containing `cpu_addr`, or `None` outside `$8000-$FFFF`.
+    pub fn for_addr(cpu_addr: u16) -> Option<Self> {
+        match cpu_addr {
+            0x8000..=0x9FFF => Some(Self::Low),
+            0xA000..=0xBFFF => Some(Self::High),
+            0xC000..=0xDFFF => Some(Self::Mid),
+            0xE000..=0xFFFF => Some(Self::Top),
+            _ => None,
+        }
+    }
+
+    /// Inclusive CPU address range of this window.
+    pub fn range(self) -> (u16, u16) {
+        match self {
+            Self::Low => (0x8000, 0x9FFF),
+            Self::High => (0xA000, 0xBFFF),
+            Self::Mid => (0xC000, 0xDFFF),
+            Self::Top => (0xE000, 0xFFFF),
+        }
+    }
+
+    /// True only for `Top`: the one window whose bank never depends on
+    /// mapper state. All other windows need live R6/R7 + PRG-mode facts.
+    pub fn always_fixed_last_bank(self) -> bool {
+        matches!(self, Self::Top)
+    }
+}
+
+/// Build the NROM-shaped 32 KiB analysis view for one MMC3 window pair:
+/// `[low_bank | high_bank | fixed last 16 KiB]`, so `$8000-$9FFF` reads the
+/// 8 KiB `low_bank`, `$A000-$BFFF` reads `high_bank`, and `$C000-$FFFF`
+/// reads the fixed top. The existing `analysis` walker (which indexes
+/// `addr - $8000`) runs on this view unchanged, constrained to
+/// `AnalysisWindow::SWITCHABLE_8K_LOW/HIGH` per entry window plus a fixed
+/// pass over the top. Fails closed on bank or length mismatches.
+pub fn mmc3_analysis_view(
+    prg: &[u8],
+    prg_8k_count: u8,
+    low_bank: u8,
+    high_bank: u8,
+) -> Result<Vec<u8>, MapperPolicyError> {
+    let prg_8k_count_usize = prg_8k_count as usize;
+    if prg_8k_count_usize < MMC3_MIN_8K_BANKS
+        || prg_8k_count_usize > MMC3_MAX_8K_BANKS
+        || prg.len() != prg_8k_count_usize * MMC3_PRG_WINDOW_SIZE
+    {
+        return Err(MapperPolicyError::InvalidMmc3PrgLayout { prg_len: prg.len() });
+    }
+    let slice8 = |bank: u8| -> Result<&[u8], MapperPolicyError> {
+        if bank >= prg_8k_count {
+            return Err(MapperPolicyError::SelectedMmc3BankOutOfRange {
+                bank,
+                bank_count: prg_8k_count,
+            });
+        }
+        let off = bank as usize * MMC3_PRG_WINDOW_SIZE;
+        Ok(&prg[off..off + MMC3_PRG_WINDOW_SIZE])
+    };
+    let mut view = Vec::with_capacity(4 * MMC3_PRG_WINDOW_SIZE);
+    view.extend_from_slice(slice8(low_bank)?);
+    view.extend_from_slice(slice8(high_bank)?);
+    view.extend_from_slice(&prg[prg.len() - 2 * MMC3_PRG_WINDOW_SIZE..]);
+    Ok(view)
+}
+
+/// A statically observed MMC3 bank-select idiom: `LDA #cfg / STA $8000 /
+/// LDA #bank / STA $8001 / JSR target` with the five instructions
+/// contiguous. `window_bank` is the 8 KiB bank the JSR target would see
+/// under the pair's PRG-mode bit (R6 for `$8000-$9FFF` in mode 0, R7 for
+/// `$A000-$BFFF`; mode-1 `$8000` shows the second-last bank instead).
+/// CANDIDATES ONLY: linear matching cannot see joins, so every candidate
+/// must be confirmed against the reference harvest (`FD_LOG_BANK_ENTRIES`
+/// `MMC3_ENTRY` lines) before becoming a profile `[[bank_entry]]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Mmc3BankCandidate {
+    /// Offset of the `LDA #cfg` in the scanned view.
+    pub offset: usize,
+    /// CPU address of the `JSR` target.
+    pub target: u16,
+    /// 8 KiB bank the target would see (or second-last bank for a mode-1
+    /// `$8000-$9FFF` target).
+    pub window_bank: u8,
+    /// True when the pair's PRG-mode bit selected the mode-1 mapping.
+    pub prg_mode: bool,
+}
+
+/// Scan `fixed_view` (the 32 KiB mode-0 `[fixed16 | fixed16]` discovery
+/// view) for contiguous bank-select idioms whose JSR lands in a switchable
+/// window. `prg_8k_count` bounds the reported banks. Returns candidates in
+/// scan order.
+pub fn harvest_mmc3_bank_candidates(fixed_view: &[u8], prg_8k_count: u8) -> Vec<Mmc3BankCandidate> {
+    let mut out = Vec::new();
+    if prg_8k_count == 0 || fixed_view.len() < 13 {
+        return out;
+    }
+    // Idiom (13 bytes): A9 cfg / 8D 00 80 / A9 bank / 8D 01 80 / 20 lo hi.
+    for (i, window) in fixed_view.windows(13).enumerate() {
+        if window[0] != 0xA9
+            || window[2] != 0x8D
+            || window[3] != 0x00
+            || window[4] != 0x80
+            || window[5] != 0xA9
+            || window[7] != 0x8D
+            || window[8] != 0x01
+            || window[9] != 0x80
+            || window[10] != 0x20
+        {
+            continue;
+        }
+        let select = window[1];
+        let bank = window[6];
+        let target = u16::from_le_bytes([window[11], window[12]]);
+        if !(0x8000..0xC000).contains(&target) {
+            continue;
+        }
+        let prg_mode = select & 0x40 != 0;
+        let r6 = bank % prg_8k_count;
+        let r7 = bank % prg_8k_count;
+        let window_bank = match target {
+            0x8000..=0x9FFF if !prg_mode => r6,
+            0x8000..=0x9FFF => prg_8k_count.wrapping_sub(2),
+            _ => r7,
+        };
+        out.push(Mmc3BankCandidate {
+            offset: i,
+            target,
+            window_bank,
+            prg_mode,
+        });
+    }
+    out
 }
 
 /// Read vectors using an explicit supported mapper policy.
@@ -731,6 +1176,309 @@ mod tests {
             resolve_mapper_policy(&header(1), 2 * PRG_BANK_SIZE),
             Err(MapperPolicyError::UnsupportedMapper { mapper: 1 })
         );
+    }
+
+    #[test]
+    fn mmc3_policy_accepts_earthbound_like_256k_and_maps_fixed_top() {
+        let header4 = Header {
+            kind: HeaderKind::INes,
+            prg_banks: 0,
+            chr_banks: 0,
+            prg_ram_size: 0,
+            prg_nvram_size: 0,
+            chr_ram_size: 0,
+            chr_nvram_size: 0,
+            mapper: 4,
+            submapper: 0,
+            mirroring: Mirroring::Horizontal,
+            has_trainer: false,
+            has_battery: true,
+        };
+        let prg_len = 256 * 1024;
+        let policy = resolve_mapper_policy(&header4, prg_len).unwrap();
+        assert!(policy.is_banked());
+        assert_eq!(policy.mmc3_8k_bank_count(), Some(32));
+        assert_eq!(policy.bank_count(), 32);
+        // Fixed top maps to the last 16 KiB regardless of window state.
+        assert_eq!(
+            policy.cpu_to_prg_offset(0xC000, 0).unwrap(),
+            Some(prg_len - 0x4000)
+        );
+        assert_eq!(
+            policy.cpu_to_prg_offset(0xFFFF, 5).unwrap(),
+            Some(prg_len - 1)
+        );
+        // Switchable windows need live R6/R7 + PRG-mode state.
+        assert_eq!(policy.cpu_to_prg_offset(0x8000, 0).unwrap(), None);
+        assert_eq!(policy.cpu_to_prg_offset(0xA000, 3).unwrap(), None);
+        // Bare-index helpers stay 8 KiB-granular and fail closed.
+        assert_eq!(
+            policy.prg_bank(&vec![0xAA; prg_len], 31).unwrap().len(),
+            8192
+        );
+        assert_eq!(
+            policy.cpu_to_prg_offset(0xC000, 32),
+            Err(MapperPolicyError::SelectedMmc3BankOutOfRange {
+                bank: 32,
+                bank_count: 32,
+            })
+        );
+        assert_eq!(
+            policy.analysis_view(&vec![0u8; prg_len], 0),
+            Err(MapperPolicyError::Mmc3WindowStateRequired)
+        );
+        assert_eq!(
+            policy.selected_bank_from_write(6, 0),
+            Err(MapperPolicyError::Mmc3WindowStateRequired)
+        );
+    }
+
+    #[test]
+    fn mmc3_policy_rejects_bad_layouts() {
+        let header4 = Header {
+            kind: HeaderKind::INes,
+            prg_banks: 0,
+            chr_banks: 0,
+            prg_ram_size: 0,
+            prg_nvram_size: 0,
+            chr_ram_size: 0,
+            chr_nvram_size: 0,
+            mapper: 4,
+            submapper: 0,
+            mirroring: Mirroring::Horizontal,
+            has_trainer: false,
+            has_battery: false,
+        };
+        for prg_len in [32 * 1024, 48 * 1024, 3 * PRG_BANK_SIZE, 65 * 8192] {
+            assert_eq!(
+                resolve_mapper_policy(&header4, prg_len),
+                Err(MapperPolicyError::InvalidMmc3PrgLayout { prg_len })
+            );
+        }
+    }
+
+    #[test]
+    fn mmc3_state_tracks_windows_modes_and_irq() {
+        let mut state = Mmc3State::default();
+        // Select R6 and map 8 KiB bank 11 at $8000 (PRG mode 0).
+        state.apply_write(0x8000, 6);
+        state.apply_write(0x8001, 11);
+        state.apply_write(0xA000 + 1, 7);
+        assert_eq!(state.prg_bank_at(0x8000, 32), Some(11));
+        assert_eq!(state.prg_bank_at(0xA000, 32), Some(1));
+        assert_eq!(state.prg_bank_at(0xC000, 32), Some(30));
+        assert_eq!(state.prg_bank_at(0xE000, 32), Some(31));
+        // PRG mode 1 swaps the $8000 and $C000 windows.
+        state.apply_write(0x8000, 0x46);
+        state.apply_write(0x8001, 5);
+        assert!(state.prg_mode());
+        assert_eq!(state.prg_bank_at(0x8000, 32), Some(30));
+        assert_eq!(state.prg_bank_at(0xC000, 32), Some(5));
+        // Bank numbers wrap into the available ROM.
+        state.apply_write(0x8000, 6);
+        state.apply_write(0x8001, 0xFF);
+        assert_eq!(state.prg_bank_at(0x8000, 32), Some(0xFF % 32));
+        // Live offsets stay inside the payload.
+        let prg_len = 256 * 1024;
+        let off = state
+            .cpu_to_prg_offset(prg_len, 32, 0x8000)
+            .expect("window offset");
+        assert!(off < prg_len);
+        assert_eq!(state.cpu_to_prg_offset(prg_len, 32, 0x7000), None);
+        // Mirroring, protect, IRQ latch/enable/disable.
+        state.apply_write(0xA000, 1);
+        assert!(state.horizontal_mirroring);
+        state.apply_write(0xC000, 0x2A);
+        state.apply_write(0xC001, 0);
+        assert!(state.irq_reload_pending);
+        state.apply_write(0xE001, 0);
+        assert!(state.irq_enabled);
+        state.apply_write(0xE000, 0);
+        assert!(!state.irq_enabled);
+        assert!(!state.irq_reload_pending);
+        // Non-mapper addresses are ignored.
+        let before = state;
+        state.apply_write(0x6000, 0xFF);
+        assert_eq!(state, before);
+    }
+
+    #[test]
+    fn mmc3_irq_counter_reloads_counts_and_holds_until_ack() {
+        let mut state = Mmc3State::default();
+        state.apply_write(0xC000, 3);
+        state.apply_write(0xC001, 0); // reload pending
+        state.apply_write(0xE001, 0); // enable
+        // Latch 3 needs four A12 clocks: reload then 3, 2, 1, 0(fire).
+        for expected in [3, 2, 1] {
+            state.clock_a12();
+            assert_eq!(state.irq_counter, expected);
+            assert!(!state.irq_pending);
+        }
+        state.clock_a12();
+        assert_eq!(state.irq_counter, 0);
+        assert!(state.irq_pending);
+        // Level holds across further clocks until the $E000 ack ...
+        state.clock_a12();
+        assert!(state.irq_pending);
+        // ... and the ack clears pending (and disables) without touching
+        // the counter value itself.
+        state.apply_write(0xE000, 0);
+        assert!(!state.irq_pending);
+        assert!(!state.irq_enabled);
+        assert_eq!(state.irq_counter, 3);
+        // Disabled counters still advance but never assert.
+        state.clock_a12();
+        assert_eq!(state.irq_counter, 2);
+        assert!(!state.irq_pending);
+    }
+
+    #[test]
+    fn mmc3_window_classifier_matches_prg_modes() {
+        assert_eq!(Mmc3Window::for_addr(0x7FFF), None);
+        assert_eq!(Mmc3Window::for_addr(0x8000), Some(Mmc3Window::Low));
+        assert_eq!(Mmc3Window::for_addr(0x9FFF), Some(Mmc3Window::Low));
+        assert_eq!(Mmc3Window::for_addr(0xA000), Some(Mmc3Window::High));
+        assert_eq!(Mmc3Window::for_addr(0xBFFF), Some(Mmc3Window::High));
+        assert_eq!(Mmc3Window::for_addr(0xC000), Some(Mmc3Window::Mid));
+        assert_eq!(Mmc3Window::for_addr(0xDFFF), Some(Mmc3Window::Mid));
+        assert_eq!(Mmc3Window::for_addr(0xE000), Some(Mmc3Window::Top));
+        assert_eq!(Mmc3Window::for_addr(0xFFFF), Some(Mmc3Window::Top));
+        assert_eq!(Mmc3Window::Low.range(), (0x8000, 0x9FFF));
+        assert_eq!(Mmc3Window::High.range(), (0xA000, 0xBFFF));
+        assert_eq!(Mmc3Window::Mid.range(), (0xC000, 0xDFFF));
+        assert_eq!(Mmc3Window::Top.range(), (0xE000, 0xFFFF));
+        assert!(Mmc3Window::Top.always_fixed_last_bank());
+        for window in [Mmc3Window::Low, Mmc3Window::High, Mmc3Window::Mid] {
+            assert!(!window.always_fixed_last_bank());
+        }
+        // Windows agree with live bank resolution: Top is the last bank in
+        // both PRG modes, and the vector page classifies as Top.
+        let mut state = Mmc3State::default();
+        assert_eq!(state.prg_bank_at(0xE000, 32), Some(31));
+        state.apply_write(0x8000, 0x40);
+        assert_eq!(state.prg_bank_at(0xE000, 32), Some(31));
+        assert_eq!(Mmc3Window::for_addr(0xFFFC), Some(Mmc3Window::Top));
+    }
+
+    #[test]
+    fn mmc3_chr_windows_resolve_1k_banks_with_invert() {
+        // Power-on R = [0,2,4,5,6,7]: identity mapping without invert.
+        let state = Mmc3State::default();
+        for slot in 0..8 {
+            assert_eq!(state.chr_bank_1k(slot), slot, "slot {slot}");
+        }
+        // Invert swaps the 4 KiB halves.
+        let mut inv = Mmc3State::default();
+        inv.apply_write(0x8000, 0x80);
+        for (slot, bank) in [
+            (0, 4),
+            (1, 5),
+            (2, 6),
+            (3, 7),
+            (4, 0),
+            (5, 1),
+            (6, 2),
+            (7, 3),
+        ] {
+            assert_eq!(inv.chr_bank_1k(slot), bank, "inverted slot {slot}");
+        }
+        // Odd R0 (5) pairs down to the even bank: slots 0-1 -> 4-5.
+        let mut odd = Mmc3State::default();
+        odd.apply_write(0x8000, 0);
+        odd.apply_write(0x8001, 5);
+        assert_eq!(odd.chr_bank_1k(0), 4);
+        assert_eq!(odd.chr_bank_1k(1), 5);
+        // Slot indices wrap into 0-7.
+        assert_eq!(state.chr_bank_1k(8), state.chr_bank_1k(0));
+    }
+
+    #[test]
+    fn mmc3_analysis_view_layouts_windows_nrom_shaped() {
+        // 8x8 KiB PRG where bank i is filled with byte i.
+        let mut prg = vec![0u8; 8 * MMC3_PRG_WINDOW_SIZE];
+        for (i, chunk) in prg.chunks_mut(MMC3_PRG_WINDOW_SIZE).enumerate() {
+            chunk.fill(i as u8);
+        }
+        let view = mmc3_analysis_view(&prg, 8, 2, 5).unwrap();
+        assert_eq!(view.len(), 4 * MMC3_PRG_WINDOW_SIZE);
+        // $8000-$9FFF -> bank 2, $A000-$BFFF -> bank 5, $C000-$FFFF fixed.
+        assert!(view[0..MMC3_PRG_WINDOW_SIZE].iter().all(|&b| b == 2));
+        assert!(
+            view[MMC3_PRG_WINDOW_SIZE..2 * MMC3_PRG_WINDOW_SIZE]
+                .iter()
+                .all(|&b| b == 5)
+        );
+        assert!(
+            view[2 * MMC3_PRG_WINDOW_SIZE..3 * MMC3_PRG_WINDOW_SIZE]
+                .iter()
+                .all(|&b| b == 6)
+        );
+        assert!(view[3 * MMC3_PRG_WINDOW_SIZE..].iter().all(|&b| b == 7));
+        // Fail closed: window bank out of range, bad count, bad length.
+        assert_eq!(
+            mmc3_analysis_view(&prg, 8, 8, 0),
+            Err(MapperPolicyError::SelectedMmc3BankOutOfRange {
+                bank: 8,
+                bank_count: 8,
+            })
+        );
+        assert_eq!(
+            mmc3_analysis_view(&prg, 8, 0, 9),
+            Err(MapperPolicyError::SelectedMmc3BankOutOfRange {
+                bank: 9,
+                bank_count: 8,
+            })
+        );
+        assert!(matches!(
+            mmc3_analysis_view(&prg[..prg.len() - 1], 8, 0, 0),
+            Err(MapperPolicyError::InvalidMmc3PrgLayout { .. })
+        ));
+        assert!(matches!(
+            mmc3_analysis_view(&prg, 7, 0, 0),
+            Err(MapperPolicyError::InvalidMmc3PrgLayout { .. })
+        ));
+    }
+
+    #[test]
+    fn mmc3_bank_candidate_harvest_needs_contiguous_idiom() {
+        // Fixed view with a mode-0 R6=5 + JSR $8123 idiom at offset 0x100,
+        // a mode-1 R6 pair + JSR $9000 (second-last bank), and a decoy with
+        // the JSR landing in fixed space (ignored).
+        let mut view = vec![0xEAu8; 0x8000];
+        view[0x100..0x10D].copy_from_slice(&[
+            0xA9, 0x06, 0x8D, 0x00, 0x80, 0xA9, 0x05, 0x8D, 0x01, 0x80, 0x20, 0x23, 0x81,
+        ]);
+        view[0x200..0x20D].copy_from_slice(&[
+            0xA9, 0x46, 0x8D, 0x00, 0x80, 0xA9, 0x03, 0x8D, 0x01, 0x80, 0x20, 0x00, 0x90,
+        ]);
+        view[0x300..0x30D].copy_from_slice(&[
+            0xA9, 0x06, 0x8D, 0x00, 0x80, 0xA9, 0x02, 0x8D, 0x01, 0x80, 0x20, 0x00, 0xC0,
+        ]);
+        let found = harvest_mmc3_bank_candidates(&view, 32);
+        assert_eq!(
+            found,
+            vec![
+                Mmc3BankCandidate {
+                    offset: 0x100,
+                    target: 0x8123,
+                    window_bank: 5,
+                    prg_mode: false,
+                },
+                Mmc3BankCandidate {
+                    offset: 0x200,
+                    target: 0x9000,
+                    window_bank: 30,
+                    prg_mode: true,
+                },
+            ]
+        );
+        // A broken idiom (STA $8000 replaced by STA $8002) yields nothing.
+        let mut broken = vec![0xEAu8; 0x8000];
+        broken[0..13].copy_from_slice(&[
+            0xA9, 0x06, 0x8D, 0x02, 0x80, 0xA9, 0x05, 0x8D, 0x01, 0x80, 0x20, 0x23, 0x81,
+        ]);
+        assert!(harvest_mmc3_bank_candidates(&broken, 32).is_empty());
+        assert!(harvest_mmc3_bank_candidates(&[], 32).is_empty());
     }
 
     #[test]

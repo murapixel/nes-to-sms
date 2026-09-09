@@ -1,0 +1,449 @@
+[rom]
+name = "mother"
+mapper = 4
+prg_kib = 256
+chr_kib = 128
+
+[vectors]
+nmi = 0xF892
+reset = 0xFF40
+irq = 0xFE7B
+
+[input]
+mode = "action"
+pause_start = true
+
+# Dynamically-reached fixed code (no static refs, found via dispatch-miss
+# $CB1B/$CB1C harvest): $CA89 is a JMP ($007C) transfer target (transfer
+# loop reached every ~7k steps). Rooted so dispatch hits exactly instead
+# of realigning/walking.
+
+[[function]]
+addr = 0xCA89
+name = "XferCA89"
+
+# Indirect-transfer hot entry (every frame via JMP ($007C)): $FA38 is
+# task-8's streaming-loop interior (INY; LDX $0400,Y; ...). No static refs
+# (data-driven pointer); without a record every dispatch misses. Rooted so
+# dispatch hits exactly (overlaps NmiTask8's walk — same bytes, entry label
+# added for the record).
+
+[[function]]
+addr = 0xFA38
+name = "Task8Loop"
+
+# NMI task vector table at $F99F (10 entries, dispatched via
+# LDA $F9A0,X / LDA $F99F,X + PHA/PHA/RTS — invisible to static discovery,
+# so every task dispatch missed and silently realigned). Rooted explicitly;
+# without these the $E5 task protocol deadlocks ($E6 never set, $BB never
+# updated). Table ends at task 9 ($FA57); task 10+ decode as garbage.
+
+[[function]]
+addr = 0xF8BC
+name = "NmiTask0"
+
+[[function]]
+addr = 0xF9B2
+name = "NmiTask1"
+
+[[function]]
+addr = 0xF9B6
+name = "NmiTask2"
+
+[[function]]
+addr = 0xF9C0
+name = "NmiTask3"
+
+[[function]]
+addr = 0xF9C8
+name = "NmiTask4"
+
+[[function]]
+addr = 0xF9F1
+name = "NmiTask5"
+
+[[function]]
+addr = 0xF9FE
+name = "NmiTask6"
+
+[[function]]
+addr = 0xFA17
+name = "NmiTask7"
+
+[[function]]
+addr = 0xFA37
+name = "NmiTask8"
+
+[[function]]
+addr = 0xFA57
+name = "NmiTask9"
+
+# (Deadlock-diagnostic stubs REMOVED 2026-09-08: testing faithful boot with
+# DIAG_DELAYNMI head-start instead. Re-add only if faithful path deadlocks.)
+
+# Fixed->window call edges verified by the reference harvest (each ran with
+# the bound bank live): $8000 under bank 28, $9400 under bank 20 (LOW), and
+# the cross-window $BF62 under bank 19 (called from bank-20 LOW code while
+# HIGH holds 19). One bank per target is enforced by profile validation;
+# unannotated window calls trap via rt_unresolved_jsr (fail closed).
+
+[[bank_call]]
+target = 0x8000
+bank = 28
+
+# $FDAD: JMP $8006 (one-shot reset tail; executes during NMI-disabled
+# pre-roll, hence absent from frame-loop harvests). Subject watch shows
+# R6 <- $1C immediately before the jump; b28 $8006 = JMP $81F5 init
+# trampoline while all other banks hold data there. Single static edge
+# (no JSR $8006 anywhere in PRG).
+
+[[bank_call]]
+target = 0x8006
+bank = 28
+
+[[bank_call]]
+target = 0x9400
+bank = 20
+
+[[bank_call]]
+target = 0xbf62
+bank = 19
+
+# MMC3 window seeds — ground truth from the reference harvest, never
+# invented. Run 1: FD_LOG_BANK_ENTRIES=1 frame-diff --ref-only, 600 frames,
+# script=none (boot -> title screen, no input). Run 2 (strict superset of
+# run 1: all 34 run-1 seeds re-observed): FD_PAUSE_START=1 (Mother's RAM
+# never sets SMB's $0770 title flag, so without it script "start" arrives
+# as NES B), 2400 frames with buttons-script pressing START past the title
+# plus dpad/SELECT; reference PPMs show title (f299) -> menu (f1500+).
+# Byte-spot-checks decode as code (b28 $8000 = JMP $827D trampoline;
+# b20 $9400 = JSR $CFB3 back into fixed; b19 $BF62 = JSR $BF95 with four
+# static JSR $BF62 callers in b20-LOW at $948C/$94C2/$94D5/$94F2).
+# A first probe misread HIGH-window bytes with LOW-window offsets and
+# briefly flagged $BF95/$BFA4/$BFAD as data; re-read at the correct
+# (addr-$A000) offsets they are code (AND #$07, LDA #$00, JSR $BFA4).
+# Run 3 (strict superset: all 48 run-2 seeds re-observed): new FD_PAD_BOTH
+# knob (face bits drive A+Select / B+Start together — Mother's RAM never
+# sets SMB's $0770 title flag, so the title/gameplay split can never yield
+# both START and A otherwise), 3600 frames with START+A+dpad script;
+# reference PPMs show title -> menu -> Japanese dialogue textbox (A taps
+# advance text). +16 seeds, all byte-checked as code with static callers
+# (b28 $8662 has 10 static JMP/JSR callers — shared vector-table routine).
+
+[[bank_entry]]
+bank = 28
+addr = 0x8000
+
+# Pre-roll reset edge ($FDAD: JMP $8006, R6=$1C): the routine must exist
+# for the bank_call above to resolve (harvest never logs pre-roll).
+
+[[bank_entry]]
+bank = 28
+addr = 0x8006
+
+[[bank_entry]]
+bank = 28
+addr = 0x8091
+
+[[bank_entry]]
+bank = 28
+addr = 0x80b8
+
+[[bank_entry]]
+bank = 28
+addr = 0x80d4
+
+[[bank_entry]]
+bank = 28
+addr = 0x80e4
+
+[[bank_entry]]
+bank = 28
+addr = 0x80fb
+
+[[bank_entry]]
+bank = 28
+addr = 0x81ba
+
+[[bank_entry]]
+bank = 28
+addr = 0x81c2
+
+[[bank_entry]]
+bank = 28
+addr = 0x81ca
+
+[[bank_entry]]
+bank = 28
+addr = 0x81d7
+
+[[bank_entry]]
+bank = 28
+addr = 0x826a
+
+[[bank_entry]]
+bank = 28
+addr = 0x827d
+
+[[bank_entry]]
+bank = 28
+addr = 0x82a5
+
+[[bank_entry]]
+bank = 28
+addr = 0x82cf
+
+[[bank_entry]]
+bank = 28
+addr = 0x82e5
+
+[[bank_entry]]
+bank = 28
+addr = 0x85b9
+
+[[bank_entry]]
+bank = 28
+addr = 0x865d
+
+[[bank_entry]]
+bank = 28
+addr = 0x8662
+
+[[bank_entry]]
+bank = 28
+addr = 0x86ef
+
+[[bank_entry]]
+bank = 28
+addr = 0x8706
+
+[[bank_entry]]
+bank = 28
+addr = 0x88d7
+
+[[bank_entry]]
+bank = 28
+addr = 0x894d
+
+[[bank_entry]]
+bank = 28
+addr = 0x89b4
+
+[[bank_entry]]
+bank = 28
+addr = 0x8a6c
+
+[[bank_entry]]
+bank = 28
+addr = 0x8ad8
+
+[[bank_entry]]
+bank = 28
+addr = 0x8b09
+
+[[bank_entry]]
+bank = 28
+addr = 0x8ba2
+
+[[bank_entry]]
+bank = 28
+addr = 0x8bbb
+
+[[bank_entry]]
+bank = 28
+addr = 0x8be3
+
+[[bank_entry]]
+bank = 28
+addr = 0x8bf0
+
+[[bank_entry]]
+bank = 28
+addr = 0x8c21
+
+[[bank_entry]]
+bank = 28
+addr = 0x8c9b
+
+[[bank_entry]]
+bank = 28
+addr = 0x8cb6
+
+[[bank_entry]]
+bank = 28
+addr = 0x8d46
+
+[[bank_entry]]
+bank = 28
+addr = 0x8d55
+
+[[bank_entry]]
+bank = 28
+addr = 0x8d7f
+
+[[bank_entry]]
+bank = 28
+addr = 0x8d8e
+
+[[bank_entry]]
+bank = 28
+addr = 0x8da6
+
+[[bank_entry]]
+bank = 28
+addr = 0x8de4
+
+[[bank_entry]]
+bank = 20
+addr = 0x9400
+
+[[bank_entry]]
+bank = 20
+addr = 0x94ec
+
+[[bank_entry]]
+bank = 20
+addr = 0x951a
+
+[[bank_entry]]
+bank = 20
+addr = 0x9523
+
+[[bank_entry]]
+bank = 20
+addr = 0x9af6
+
+[[bank_entry]]
+bank = 20
+addr = 0x9b8b
+
+[[bank_entry]]
+bank = 20
+addr = 0x9b91
+
+[[bank_entry]]
+bank = 20
+addr = 0x9c46
+
+[[bank_entry]]
+bank = 20
+addr = 0x9ca2
+
+[[bank_entry]]
+bank = 20
+addr = 0x9ca9
+
+[[bank_entry]]
+bank = 20
+addr = 0x9cf7
+
+[[bank_entry]]
+bank = 20
+addr = 0x9d01
+
+[[bank_entry]]
+bank = 20
+addr = 0x9d21
+
+[[bank_entry]]
+bank = 20
+addr = 0x9d3e
+
+[[bank_entry]]
+bank = 20
+addr = 0x9d44
+
+[[bank_entry]]
+bank = 20
+addr = 0x9dce
+
+[[bank_entry]]
+bank = 20
+addr = 0x9e13
+
+[[bank_entry]]
+bank = 20
+addr = 0x9e23
+
+[[bank_entry]]
+bank = 20
+addr = 0x9ed7
+
+[[bank_entry]]
+bank = 20
+addr = 0x9eef
+
+[[bank_entry]]
+bank = 20
+addr = 0x9eff
+
+# Run-2 HIGH-window seeds: first bank observed live in $A000-$BFFF
+# (bank8=19). Reached via b20-LOW JSRs; $BF62 self-calls into $BF95.
+
+[[bank_entry]]
+bank = 19
+addr = 0xbf62
+
+[[bank_entry]]
+bank = 19
+addr = 0xbf95
+
+[[bank_entry]]
+bank = 19
+addr = 0xbfa4
+
+[[bank_entry]]
+bank = 19
+addr = 0xbfad
+
+# $E5 task-flag writers (static scan for STA $E5 / STX $E5 + byte-checks:
+# all decode as code; e.g. b20 $968F = STA $E5; RTS, b19 $97F6 =
+# STA $E5; RTS). The NMI/main $FDBB wait spins on LDA $E5 / ORA $E0, so
+# every writer must be translated for the flag protocol to complete.
+# (Fixed-bank $E0 writers at $F8BB/$F963 need no seeds — fixed pass covers
+# $C000-$FFFF.)
+
+[[bank_entry]]
+bank = 20
+addr = 0x968f
+
+[[bank_entry]]
+bank = 20
+addr = 0x96d2
+
+[[bank_entry]]
+bank = 20
+addr = 0x97fb
+
+[[bank_entry]]
+bank = 19
+addr = 0x8d54
+
+[[bank_entry]]
+bank = 19
+addr = 0x9766
+
+[[bank_entry]]
+bank = 19
+addr = 0x9774
+
+[[bank_entry]]
+bank = 19
+addr = 0x97cf
+
+[[bank_entry]]
+bank = 19
+addr = 0x97e0
+
+[[bank_entry]]
+bank = 19
+addr = 0x97f6
+
+[[bank_entry]]
+bank = 19
+addr = 0x9ea1
+
+# NOTE: b18 $97B6 (STA $E0 writer) deliberately NOT seeded: its 4th byte is
+# JAM opcode 0x0B (ANC #imm — fail-closed in the pipeline), so the routine
+# cannot lower. $E0 clearers already exist in fixed code ($F8BB NMI path,
+# $F963 LDA #0 / STA $E0). Revisit if a future harvest shows bank 18 live.

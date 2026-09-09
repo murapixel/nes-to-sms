@@ -1059,7 +1059,13 @@ rt_sound_stub:
 ; maps the matching SMS data bank into slot 2 immediately — every
 ; existing PRG-window read path then sees the right bytes with zero
 ; per-read cost.
+; MMC3 (mapper 4): decoded in runtime/mapper_mmc3.s (register file, PRG/CHR
+; windows, IRQ). Window reads go through helpers against live shadows, so
+; nothing is mapped here.
 rt_mapper_write:
+.ifdef NES_MMC3
+  jp  rt_mmc3_write
+.endif
 .ifndef NES_PRG_BANK_BASE
   ret
 .else
@@ -1161,10 +1167,17 @@ _mw_halt:
 ; ─── rt_restore_prg_window ────────────────────────────────────────────────────
 ; Restore slot 2 to the CURRENT NES PRG window after a temporary remap
 ; (CHR maps, chr data, prg_high). NROM: the single data_prg_low bank.
-; Banked: the bank selected by the mapper shadow. Clobbers A.
+; Banked: the bank selected by the mapper shadow. MMC3: the canonical LOW
+; window half (helpers manage their own mappings; nothing reads slot 2
+; directly). Clobbers A.
 rt_restore_prg_window:
   xor  a
   ld   ($fffc), a
+.ifdef NES_MMC3
+  ld   a, (MMC3_PRG_LOW)
+  add  a, NES_MMC3_PRG_BASE
+  ld   ($ffff), a
+.else
 .ifdef NES_PRG_BANK_BASE
   ld   a, ($cb62)
   add  a, NES_PRG_BANK_BASE
@@ -1172,6 +1185,7 @@ rt_restore_prg_window:
 .else
   ld   a, :data_prg_low
   ld   ($ffff), a
+.endif
 .endif
   ret
 

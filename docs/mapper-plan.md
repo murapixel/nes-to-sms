@@ -268,6 +268,43 @@ MMC3 counter onto the SMS VDP line interrupt (the split machinery
 already drives it; MMC3 games configure a line and flip scroll/banks
 there — same shape as the SMB sprite-0 split, now data-driven).
 
+### M3 status — foundation landed, translation still gated
+
+1. Loader (`nes_rom`): `MapperPolicy::Mmc3` accepts 64–512 KiB PRG
+   (8 KiB units); `Mmc3State` models `$8000` select/data, R0–R7,
+   mirroring, IRQ latch/enable/counter (`clock_a12`, MMC3B/C) and the
+   `Mmc3Window` classifier. Bare-index helpers fail closed on the
+   switchable windows (`Mmc3WindowStateRequired`).
+2. Reference bus (`frame-diff`): PRG windows, CHR 1 KiB windows
+   (canonical `chr_bank_1k`), SRAM, mirroring state, scanline pacing
+   with A12 gating + `cpu.irq` in every stepping loop; `MMC3_ENTRY`
+   harvest lines use a distinct format so 8 KiB numbers cannot leak
+   into 16 KiB profile fields. Proven by a hand-assembled 64 KiB
+   smoke ROM (bank-switched JSR + NMI + IRQ through `run_reference`).
+3. Profile: `(window, bank)` schema in 8 KiB units for mapper 4
+   (`[[bank_entry]]`, `[[bank_call]]`, `[[jump_engine]]`,
+   `[[return_escape]]`, `[[return_consume]]`).
+4. Discovery: `mmc3_analysis_view` (low8|high8|fixed16) + 8 KiB
+   `AnalysisWindow`s run the existing walker unchanged; the pipeline
+   runs an MMC3 discovery-only mode (fixed mode-0 pass + per-entry
+   window passes, `reports/discovery.txt` with the fixed→window
+   attack list and UNVERIFIED static-idiom `CANDIDATE` lines from
+   `harvest_mmc3_bank_candidates`), then fails closed — no project
+   is emitted. Candidates must be confirmed against the `MMC3_ENTRY`
+   reference harvest before becoming `[[bank_entry]]` facts.
+5. Lowering audit: no lowering change needed for MMC3 stores —
+   `Op::MapperWrite` already preserves exact addresses for every
+   register family (`$8000`/`$8001`/`$A000`/`$C000`/`$E000`) and the
+   runtime shim will decode them. PRG-RAM stores stay fail-closed
+   pending the SRAM path.
+6. Assets: `mmc3_chr_banks_to_sms_4bpp` emits one 4bpp blob per 1 KiB
+   CHR bank with the runtime upload contract documented.
+
+Still open: paired `$8000`/`$8001` bank-constant propagation bound to
+real roots, lowering enablement, `runtime/mapper_mmc3.s` (needs the
+WLA-DX toolchain to verify), 8 KiB SMS data-bank emission, scanline
+IRQ → VDP line-interrupt mapping, and bring-up against a real ROM.
+
 ## M4 — MMC5 (Castlevania III)
 
 Everything above plus ExRAM modes, fill mode, vertical split,

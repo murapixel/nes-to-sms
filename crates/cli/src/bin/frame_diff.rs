@@ -233,6 +233,14 @@ struct NesBus {
     /// UxROM: selected 16 KiB bank at $8000-$BFFF.
     prg_bank: u8,
     mapper_policy: nes_rom::MapperPolicy,
+    /// MMC3 live register state ($8000-$FFFF paired select/data writes,
+    /// mirroring, IRQ latch/enable). Only meaningful when `mapper_policy`
+    /// is `Mmc3`; UxROM/NROM builds leave it at power-on defaults.
+    mmc3: nes_rom::Mmc3State,
+    /// MMC3 PRG-RAM ($6000-$7FFF, 8 KiB). Permissive model: always
+    /// readable/writable; `$A001` protect bits are recorded in
+    /// `mmc3.prg_ram_protect` but not enforced yet.
+    sram: [u8; 0x2000],
     /// CHR-RAM store for pattern-space $2007 writes (ground truth).
     chr_ram: Vec<u8>,
     /// PPU palette RAM ($3F00-$3F1F) captured from $2007 writes, so the
@@ -310,18 +318,131 @@ impl NesBus {
             ppu_log_count: 0,
             prg_bank: 0,
             mapper_policy,
+            mmc3: nes_rom::Mmc3State::default(),
+            sram: [0; 0x2000],
             chr_ram: vec![0u8; 0x3000],
             palette_ram: [0u8; 32],
             scroll_x_last: 0,
         }
     }
 
+    fn mmc3_8k_count(&self) -> Option<u8> {
+        self.mapper_policy.mmc3_8k_bank_count()
+    }
+
+    /// Bank identity for diagnostics at a CPU address: UxROM returns the
+    /// selected 16 KiB bank, MMC3 returns the live 8 KiB window bank at
+    /// `pc` (0xFF outside PRG).
+    fn exec_bank_for(&self, pc: u16) -> u8 {
+        match self.mmc3_8k_count() {
+            Some(count) => self.mmc3.prg_bank_at(pc, count).unwrap_or(0xFF),
+            None => self.prg_bank,
+        }
+    }
+
+    fn current_exec_bank(&self) -> u8 {
+        self.exec_bank_for(self.last_pc)
+    }
+
+    /// Translate a PPU pattern-table address ($0000-$1FFF) to a CHR-ROM
+    /// byte offset through the MMC3 R0-R5 windows and the CHR-invert bit
+    /// (canonical resolution lives on `Mmc3State::chr_bank_1k`; this only
+    /// applies the payload size). Returns `None` outside pattern space or
+    /// with no CHR ROM present.
+    fn mmc3_chr_offset(&self, addr: usize) -> Option<usize> {
+        if addr >= 0x2000 || self.chr.is_empty() {
+            return None;
+        }
+        let slot = addr >> 10; // eight 1 KiB slots
+        let sub = addr & 0x3FF;
+        let bank_1k = self.mmc3.chr_bank_1k(slot as u8) as usize;
+        let banks_1k = self.chr.len() / 1024;
+        if banks_1k == 0 {
+            return None;
+        }
+        Some((bank_1k % banks_1k) * 1024 + sub)
+    }
+
+    /// Pattern-space byte for buffered $2007 reads and ground-truth
+    /// rendering: CHR ROM directly for NROM, through MMC3 windows for
+    /// mapper 4, CHR-RAM shadow when no CHR ROM is present.
+    fn pattern_byte(&self, addr: usize) -> u8 {
+        if addr >= 0x2000 {
+            return 0;
+        }
+        if self.mmc3_8k_count().is_some() {
+            if let Some(off) = self.mmc3_chr_offset(addr) {
+                return *self.chr.get(off).unwrap_or(&0);
+            }
+            return 0;
+        }
+        if !self.chr.is_empty() {
+            *self.chr.get(addr % self.chr.len()).unwrap_or(&0)
+        } else {
+            self.chr_ram[addr & 0x1FFF]
+        }
+    }
+
+    /// One scanline's worth of PPU time for the MMC3 A12 counter. The
+    /// hardware clocks on A12 rises during rendering fetches into
+    /// `$1000-$1FFF`; without rendering — or with both pattern tables in
+    /// `$0000-$0FFF` — no rise occurs and the counter holds. Non-MMC3
+    /// builds return immediately.
+    fn mmc3_scanline_tick(&mut self) {
+        if self.mmc3_8k_count().is_none() {
+            return;
+        }
+        if self.ppu_mask & 0x18 == 0 {
+            return;
+        }
+        if self.ppu_ctrl & 0x18 == 0 {
+            return;
+        }
+        self.mmc3.clock_a12();
+    }
+
+    /// MMC3 scanline pacing hook, called once per reference CPU step from
+    /// every stepping loop. Counts instructions toward one NTSC scanline,
+    /// clocks the A12 counter when the PPU would raise A12, then services
+    /// a pending IRQ through the CPU (which itself honors the I flag, so
+    /// the level-held line re-fires after RTI until the game acks with
+    /// `$E000`). Approximate by construction: the oracle reports
+    /// instructions, not cycles — one scanline is ~113.66 CPU cycles, so
+    /// `steps_per_scanline` instructions stand in for it (default 32).
+    /// Override with `FD_MMC3_STEPS_PER_SCANLINE`.
+    fn before_step_mmc3(
+        &mut self,
+        cpu: &mut oracle_6502::Cpu,
+        divider: &mut usize,
+        steps_per_scanline: usize,
+    ) {
+        if self.mmc3_8k_count().is_none() || steps_per_scanline == 0 {
+            return;
+        }
+        *divider += 1;
+        if *divider >= steps_per_scanline {
+            *divider = 0;
+            self.mmc3_scanline_tick();
+        }
+        if self.mmc3.irq_pending {
+            cpu.irq(self);
+        }
+    }
+
     fn prg_read(&self, addr: u16) -> u8 {
+        if let Some(count) = self.mmc3_8k_count() {
+            let prg_len = self.prg.len();
+            let off = self
+                .mmc3
+                .cpu_to_prg_offset(prg_len, count, addr)
+                .expect("MMC3 reference window maps PRG address");
+            return self.prg[off];
+        }
         let off = self
             .mapper_policy
             .cpu_to_prg_offset(addr, self.prg_bank)
             .expect("valid reference mapper bank")
-            .expect("PRG read address");
+            .expect("PRG read address (MMC3 switchable windows need Mmc3State)");
         self.prg[off]
     }
 }
@@ -357,16 +478,12 @@ impl oracle_6502::Bus for NesBus {
                     }
                     0x2007 => {
                         // Buffered PPUDATA read: returns the buffer, then
-                        // refills it from the current VRAM address. CHR
-                        // ROM ($0000-$1FFF) is the only backing store the
-                        // reference models; nametable reads return 0.
+                        // refills it from the current VRAM address. Pattern
+                        // space routes through MMC3 CHR windows when
+                        // present; nametable reads return 0.
                         let ret = self.ppu_read_buffer;
                         let a = (self.ppu_addr & 0x3FFF) as usize;
-                        self.ppu_read_buffer = if a < 0x2000 {
-                            *self.chr.get(a).unwrap_or(&0)
-                        } else {
-                            0
-                        };
+                        self.ppu_read_buffer = if a < 0x2000 { self.pattern_byte(a) } else { 0 };
                         let inc = if self.ppu_ctrl & 0x04 != 0 { 32 } else { 1 };
                         self.ppu_addr = self.ppu_addr.wrapping_add(inc);
                         ret
@@ -405,6 +522,7 @@ impl oracle_6502::Bus for NesBus {
                 v
             }
             0x4017 => 0x40, // controller 2: nothing pressed
+            0x6000..=0x7FFF => self.sram[(addr - 0x6000) as usize],
             0x8000..=0xFFFF => self.prg_read(addr),
             _ => 0,
         }
@@ -423,7 +541,7 @@ impl oracle_6502::Bus for NesBus {
                         // time — instead store bank in value's spare... no:
                         // simplest is a parallel log.
                         self.watch_log.push((nes, value, self.last_pc));
-                        self.watch_bank_log.push(self.prg_bank);
+                        self.watch_bank_log.push(self.current_exec_bank());
                     }
                 }
             }
@@ -459,7 +577,7 @@ impl oracle_6502::Bus for NesBus {
                             "REF_PPU_WRITE frame={} bank={} pc=${:04X} addr=${a:04X} value=${value:02X} ctrl=${:02X}",
                             self.current_frame
                                 .map_or_else(|| "pre".to_string(), |frame| frame.to_string()),
-                            self.prg_bank,
+                            self.current_exec_bank(),
                             self.last_pc,
                             self.ppu_ctrl,
                         );
@@ -526,13 +644,22 @@ impl oracle_6502::Bus for NesBus {
                 }
                 self.strobe = new_strobe;
             }
+            0x6000..=0x7FFF => {
+                self.sram[(addr - 0x6000) as usize] = value;
+            }
             0x8000..=0xFFFF => {
-                if self.mapper_policy.is_banked() {
+                if self.mmc3_8k_count().is_some() {
+                    // MMC3 paired select/data protocol ($8000 even =
+                    // register select incl. C/P mode bits, $8001 odd =
+                    // data; plus $A000/$C000/$E000 families). No bus
+                    // conflicts: the written value applies directly.
+                    self.mmc3.apply_write(addr, value);
+                } else if self.mapper_policy.is_banked() {
                     let bus_byte = self.prg_read(addr);
                     self.prg_bank = self
                         .mapper_policy
                         .selected_bank_from_write(value, bus_byte)
-                        .expect("valid mapper write bank");
+                        .expect("valid mapper write bank (MMC3 needs paired $8000/$8001 state)");
                 }
             }
             _ => {}
@@ -575,6 +702,181 @@ mod mapper_tests {
         oracle_6502::Bus::write(&mut bus, 0x8000, 1);
         assert_eq!(bus.prg_bank, 1);
     }
+
+    fn mmc3_policy() -> nes_rom::MapperPolicy {
+        nes_rom::MapperPolicy::Mmc3 { prg_8k_count: 8 }
+    }
+
+    /// 8 x 8 KiB PRG where bank i is filled with byte i; 8 KiB CHR ROM
+    /// where 1 KiB bank j is filled with byte 0x40+j.
+    fn mmc3_bus() -> NesBus {
+        let mut prg = vec![0u8; 8 * 8192];
+        for (i, chunk) in prg.chunks_mut(8192).enumerate() {
+            chunk.fill(i as u8);
+        }
+        let mut chr = vec![0u8; 8 * 1024];
+        for (j, chunk) in chr.chunks_mut(1024).enumerate() {
+            chunk.fill(0x40 + j as u8);
+        }
+        NesBus::new(prg, chr, mmc3_policy())
+    }
+
+    #[test]
+    fn mmc3_windows_follow_r6_r7_and_prg_mode() {
+        let mut bus = mmc3_bus();
+        // Power-on: R6=0 at $8000, R7=1 at $A000, second-last at $C000.
+        assert_eq!(oracle_6502::Bus::read(&mut bus, 0x8000), 0);
+        assert_eq!(oracle_6502::Bus::read(&mut bus, 0xA000), 1);
+        assert_eq!(oracle_6502::Bus::read(&mut bus, 0xC000), 6);
+        assert_eq!(oracle_6502::Bus::read(&mut bus, 0xE000), 7);
+        // Paired writes: $8000 even selects R6, $8001 odd writes the data.
+        oracle_6502::Bus::write(&mut bus, 0x8000, 6);
+        oracle_6502::Bus::write(&mut bus, 0x8001, 5);
+        oracle_6502::Bus::write(&mut bus, 0x8000, 7);
+        oracle_6502::Bus::write(&mut bus, 0x8001, 3);
+        assert_eq!(oracle_6502::Bus::read(&mut bus, 0x8000), 5);
+        assert_eq!(oracle_6502::Bus::read(&mut bus, 0xA123), 3);
+        // PRG mode 1 swaps the $8000 and $C000 windows.
+        oracle_6502::Bus::write(&mut bus, 0x8000, 0x40 | 6);
+        oracle_6502::Bus::write(&mut bus, 0x8001, 2);
+        assert_eq!(oracle_6502::Bus::read(&mut bus, 0x8000), 6);
+        assert_eq!(oracle_6502::Bus::read(&mut bus, 0xC000), 2);
+        // Fixed top never moves.
+        assert_eq!(oracle_6502::Bus::read(&mut bus, 0xE000), 7);
+    }
+
+    #[test]
+    fn mmc3_chr_windows_follow_r0_r5_and_invert() {
+        let bus = mmc3_bus();
+        // Power-on R0=0,R1=2: slots 0-1 -> 1 KiB banks 0-1, slots 2-3 -> 2-3.
+        assert_eq!(bus.pattern_byte(0x0000), 0x40);
+        assert_eq!(bus.pattern_byte(0x0400), 0x41);
+        assert_eq!(bus.pattern_byte(0x0800), 0x42);
+        let mut inv = mmc3_bus();
+        oracle_6502::Bus::write(&mut inv, 0x8000, 0x80);
+        // Invert swaps the 4 KiB halves: slot 0 now serves R2 (=4).
+        assert_eq!(inv.pattern_byte(0x0000), 0x44);
+        assert_eq!(inv.pattern_byte(0x1000), 0x40);
+    }
+
+    #[test]
+    fn mmc3_sram_and_mirroring_and_irq_latch() {
+        let mut bus = mmc3_bus();
+        oracle_6502::Bus::write(&mut bus, 0x6000, 0x5A);
+        assert_eq!(oracle_6502::Bus::read(&mut bus, 0x6000), 0x5A);
+        assert!(!bus.mmc3.horizontal_mirroring);
+        oracle_6502::Bus::write(&mut bus, 0xA000, 1);
+        assert!(bus.mmc3.horizontal_mirroring);
+        oracle_6502::Bus::write(&mut bus, 0xC000, 0x2A);
+        oracle_6502::Bus::write(&mut bus, 0xE001, 0);
+        assert_eq!(bus.mmc3.irq_latch, 0x2A);
+        assert!(bus.mmc3.irq_enabled);
+        oracle_6502::Bus::write(&mut bus, 0xE000, 0);
+        assert!(!bus.mmc3.irq_enabled);
+    }
+
+    #[test]
+    fn mmc3_scanline_tick_needs_rendering_and_upper_pattern_table() {
+        let mut bus = mmc3_bus();
+        bus.mmc3.irq_latch = 5;
+        bus.mmc3.irq_counter = 5;
+        bus.mmc3.irq_reload_pending = false;
+        // Rendering off: counter holds.
+        bus.mmc3_scanline_tick();
+        assert_eq!(bus.mmc3.irq_counter, 5);
+        // Rendering on but both tables in $0000: no A12 rise, holds.
+        bus.ppu_mask = 0x18;
+        bus.ppu_ctrl = 0x00;
+        bus.mmc3_scanline_tick();
+        assert_eq!(bus.mmc3.irq_counter, 5);
+        // BG from $1000: clocks.
+        bus.ppu_ctrl = 0x10;
+        bus.mmc3_scanline_tick();
+        assert_eq!(bus.mmc3.irq_counter, 4);
+    }
+
+    /// Hand-assembled 64 KiB (8x8 KiB) MMC3 smoke ROM:
+    /// - RESET ($C000): CLI, NMI-enable + BG-$1000 ($2000=$90), rendering on,
+    ///   R6=5 via paired $8000/$8001, JSR $8000 (bank-5 code stores $42),
+    ///   IRQ latch 10 + reload + enable, then a self-loop.
+    /// - Bank 5 at $8000: `LDA #$42; STA $10; RTS`.
+    /// - NMI ($D000): `INC $11; RTI`. IRQ ($D100): `INC $12`,
+    ///   sticky `$13=$AA`, ack + re-enable, `RTI`.
+    /// - Vectors (fixed top): NMI $D000, RESET $C000, IRQ $D100.
+    /// The rest of PRG is NOP fill; CHR is blank 8 KiB.
+    fn mmc3_smoke_rom() -> (Vec<u8>, Vec<u8>) {
+        let mut prg = vec![0xEAu8; 8 * 8192];
+        prg[5 * 8192..5 * 8192 + 5].copy_from_slice(&[0xA9, 0x42, 0x85, 0x10, 0x60]);
+        let reset: [u8; 40] = [
+            0x58, // CLI
+            0xA9, 0x90, 0x8D, 0x00, 0x20, // LDA #$90; STA $2000
+            0xA9, 0x1E, 0x8D, 0x01, 0x20, // LDA #$1E; STA $2001
+            0xA9, 0x06, 0x8D, 0x00, 0x80, // LDA #6; STA $8000 (select R6)
+            0xA9, 0x05, 0x8D, 0x01, 0x80, // LDA #5; STA $8001 (R6 = 5)
+            0x20, 0x00, 0x80, // JSR $8000
+            0xA9, 0x0A, 0x8D, 0x00, 0xC0, // LDA #10; STA $C000 (latch)
+            0xA9, 0x00, 0x8D, 0x01, 0xC0, // LDA #0; STA $C001 (reload)
+            0x8D, 0x01, 0xE0, // STA $E001 (enable)
+            0x4C, 0x00, 0x00, // JMP self (patched below)
+        ];
+        let base = 6 * 8192;
+        prg[base..base + reset.len()].copy_from_slice(&reset);
+        let loop_at = 0xC000 + reset.len() - 3;
+        prg[base + reset.len() - 2] = (loop_at & 0xFF) as u8;
+        prg[base + reset.len() - 1] = (loop_at >> 8) as u8;
+        prg[base + 0x1000..base + 0x1003].copy_from_slice(&[0xE6, 0x11, 0x40]);
+        prg[base + 0x1100..base + 0x110F].copy_from_slice(&[
+            0xE6, 0x12, // INC $12
+            0xA9, 0xAA, 0x85, 0x13, // LDA #$AA; STA $13 (sticky)
+            0xA9, 0x00, // LDA #0
+            0x8D, 0x00, 0xE0, // STA $E000 (ack)
+            0x8D, 0x01, 0xE0, // STA $E001 (re-enable)
+            0x40, // RTI
+        ]);
+        let len = prg.len();
+        // Little-endian vectors: NMI $D000, RESET $C000, IRQ $D100.
+        prg[len - 6..len].copy_from_slice(&[0x00, 0xD0, 0x00, 0xC0, 0x00, 0xD1]);
+        (prg, vec![0u8; 8192])
+    }
+
+    #[test]
+    fn mmc3_reference_runs_bank_switch_nmi_and_irq() {
+        let (prg, chr) = mmc3_smoke_rom();
+        let timeline = ButtonTimeline::builtin("none".to_string());
+        let (_init, snaps) = run_reference(prg, chr, mmc3_policy(), 2, &timeline);
+        assert_eq!(snaps.len(), 2);
+        let ram = snaps.last().unwrap();
+        assert_eq!(ram[0x10], 0x42, "R6-switched JSR $8000 ran");
+        assert_eq!(ram[0x11], 2, "exactly one NMI per frame");
+        assert_eq!(ram[0x13], 0xAA, "scanline IRQ handler ran");
+    }
+
+    #[test]
+    fn mmc3_before_step_fires_irq_through_cpu() {
+        // 8x8K PRG with the IRQ vector pointing at $9000 and reset at $8000.
+        let mut prg = vec![0u8; 8 * 8192];
+        let len = prg.len();
+        prg[len - 4..len - 2].copy_from_slice(&0x8000u16.to_le_bytes());
+        prg[len - 2..].copy_from_slice(&0x9000u16.to_le_bytes());
+        let mut bus = NesBus::new(prg, vec![0u8; 8192], mmc3_policy());
+        let mut cpu = oracle_6502::Cpu::new();
+        cpu.reset(&mut bus);
+        cpu.p &= !oracle_6502::FLAG_I; // CLI: allow IRQs
+        // Latch 1, reload armed, enabled, rendering with BG from $1000.
+        oracle_6502::Bus::write(&mut bus, 0xC000, 1);
+        oracle_6502::Bus::write(&mut bus, 0xC001, 0);
+        oracle_6502::Bus::write(&mut bus, 0xE001, 0);
+        bus.ppu_mask = 0x18;
+        bus.ppu_ctrl = 0x10;
+        let mut div = 0usize;
+        // Latch 1 needs two scanline ticks (reload, then 0=fire); with
+        // steps_per=1 every helper call ticks once.
+        bus.before_step_mmc3(&mut cpu, &mut div, 1);
+        assert_ne!(cpu.pc, 0x9000);
+        bus.before_step_mmc3(&mut cpu, &mut div, 1);
+        assert_eq!(cpu.pc, 0x9000);
+        assert!(cpu.p & oracle_6502::FLAG_I != 0);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -611,9 +913,10 @@ fn render_nes_ppm(bus: &NesBus, path: &str) -> std::io::Result<()> {
     let bg_pattern = if bus.ppu_ctrl & 0x10 != 0 { 0x1000 } else { 0 };
     let spr_pattern = if bus.ppu_ctrl & 0x08 != 0 { 0x1000 } else { 0 };
     let chr = |addr: usize| -> u8 {
-        // Pattern reads come from CHR ROM when present, else the CHR-RAM shadow.
-        if !bus.chr.is_empty() {
-            bus.chr[addr % bus.chr.len()]
+        // Pattern reads come from CHR ROM (through MMC3 windows when
+        // present), else the CHR-RAM shadow.
+        if bus.mmc3_8k_count().is_some() || !bus.chr.is_empty() {
+            bus.pattern_byte(addr)
         } else {
             bus.chr_ram[addr & 0x1FFF]
         }
@@ -727,6 +1030,13 @@ fn run_reference(
     let mut cpu = Cpu::new();
     let mut bus = NesBus::new(prg, chr, mapper_policy);
     cpu.reset(&mut bus);
+    // MMC3 scanline pacing: instructions per emulated scanline for the
+    // A12 counter (default 32 ≈ 113.66 cycles at ~3.5 cycles/insn).
+    let mmc3_steps_per_scanline: usize = std::env::var("FD_MMC3_STEPS_PER_SCANLINE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(32);
+    let mut mmc3_div = 0usize;
 
     // Pre-roll: run reset-init until NMI is enabled. SMB polls $2002 for
     // VBlank during this phase, so keep VBlank available.
@@ -734,6 +1044,7 @@ fn run_reference(
     let mut pre = 0usize;
     while !bus.nmi_enabled && pre < REF_PREROLL_CAP {
         bus.last_pc = cpu.pc;
+        bus.before_step_mmc3(&mut cpu, &mut mmc3_div, mmc3_steps_per_scanline);
         if cpu.step(&mut bus).is_err() {
             break;
         }
@@ -764,6 +1075,7 @@ fn run_reference(
             }
             for _ in 0..REF_INSN_PER_FRAME {
                 bus.last_pc = cpu.pc;
+                bus.before_step_mmc3(&mut cpu, &mut mmc3_div, mmc3_steps_per_scanline);
                 if cpu.step(&mut bus).is_err() {
                     break;
                 }
@@ -786,6 +1098,7 @@ fn run_reference(
             }
             for _ in 0..REF_INSN_PER_FRAME {
                 bus.last_pc = cpu.pc;
+                bus.before_step_mmc3(&mut cpu, &mut mmc3_div, mmc3_steps_per_scanline);
                 if cpu.step(&mut bus).is_err() {
                     break;
                 }
@@ -918,13 +1231,20 @@ fn run_reference(
         }
         for _ in 0..REF_INSN_PER_FRAME {
             bus.last_pc = cpu.pc;
+            bus.before_step_mmc3(&mut cpu, &mut mmc3_div, mmc3_steps_per_scanline);
             if trace_pc_hits < trace_pc_limit && trace_pc_list.contains(&cpu.pc) {
                 let stack_p = bus.ram[0x0100 | cpu.sp.wrapping_add(1) as usize];
                 let stack_lo = bus.ram[0x0100 | cpu.sp.wrapping_add(2) as usize];
                 let stack_hi = bus.ram[0x0100 | cpu.sp.wrapping_add(3) as usize];
                 eprintln!(
                     "TRACE_PC frame={frame} bank={} pc=${:04X} A=${:02X} X=${:02X} Y=${:02X} P=${:02X} SP=${:02X} stack_p=${stack_p:02X} stack_pc=${stack_hi:02X}{stack_lo:02X}",
-                    bus.prg_bank, cpu.pc, cpu.a, cpu.x, cpu.y, cpu.p, cpu.sp
+                    bus.exec_bank_for(cpu.pc),
+                    cpu.pc,
+                    cpu.a,
+                    cpu.x,
+                    cpu.y,
+                    cpu.p,
+                    cpu.sp
                 );
                 trace_pc_hits += 1;
             }
@@ -943,16 +1263,29 @@ fn run_reference(
                     if op == 0x20 {
                         let t = bus.prg_read(cpu.pc.wrapping_add(1)) as u16
                             | (bus.prg_read(cpu.pc.wrapping_add(2)) as u16) << 8;
-                        call_log.push((frame, bus.prg_bank, cpu.pc, t));
+                        call_log.push((frame, bus.exec_bank_for(cpu.pc), cpu.pc, t));
                     }
                 }
             }
             if log_bank_entries && cpu.pc < 0x2000 {
-                eprintln!("RAM_EXEC pc=${:04X} bank={}", cpu.pc, bus.prg_bank);
+                eprintln!(
+                    "RAM_EXEC pc=${:04X} bank={}",
+                    cpu.pc,
+                    bus.exec_bank_for(cpu.pc)
+                );
             }
             if log_bank_entries {
                 // Ground truth for [[bank_entry]]: JSR/JMP whose operand
-                // lands in the switchable window, keyed by the mapped bank.
+                // lands in the switchable window, keyed by the mapped bank
+                // (UxROM 16 KiB bank, MMC3 live 8 KiB window bank at the
+                // target — 8 KiB units, see Mmc3State).
+                // Harvest helper: bank key for a switchable-window target.
+                let entry_bank = |bus: &NesBus, t: u16| -> u8 {
+                    match bus.mmc3_8k_count() {
+                        Some(count) => bus.mmc3.prg_bank_at(t, count).unwrap_or(0xFF),
+                        None => bus.prg_bank,
+                    }
+                };
                 let pc = cpu.pc;
                 if pc >= 0x8000 {
                     let op = bus.prg_read(pc);
@@ -969,14 +1302,14 @@ fn run_reference(
                             0
                         };
                         if (0x8000..0xC000).contains(&t) {
-                            bank_entry_set.insert((bus.prg_bank, t));
+                            bank_entry_set.insert((entry_bank(&bus, t), t));
                         }
                     }
                     if op == 0x20 || op == 0x4C {
                         let t = bus.prg_read(pc.wrapping_add(1)) as u16
                             | (bus.prg_read(pc.wrapping_add(2)) as u16) << 8;
                         if (0x8000..0xC000).contains(&t) {
-                            bank_entry_set.insert((bus.prg_bank, t));
+                            bank_entry_set.insert((entry_bank(&bus, t), t));
                         }
                     }
                 }
@@ -1029,8 +1362,16 @@ fn run_reference(
         }
     }
     if log_bank_entries {
+        // UxROM keys are 16 KiB banks; MMC3 keys are live 8 KiB window
+        // banks at the target — keep the formats distinct so 8 KiB
+        // numbers can never be pasted into 16 KiB profile fields.
+        let mmc3 = bus.mmc3_8k_count().is_some();
         for (b, t) in &bank_entry_set {
-            eprintln!("BANK_ENTRY bank={b} addr=0x{t:04x}");
+            if mmc3 {
+                eprintln!("MMC3_ENTRY bank8={b} addr=0x{t:04x}");
+            } else {
+                eprintln!("BANK_ENTRY bank={b} addr=0x{t:04x}");
+            }
         }
     }
     if std::env::var("FD_DUMP_NT").is_ok() {
@@ -1072,6 +1413,17 @@ fn run_reference(
                 .map(|b| format!("{b:02X}"))
                 .collect();
             eprintln!("CHRRAM tile {tile:03X}: {}", hex.join(" "));
+        }
+    }
+    // FD_DUMP_SRAM=path: write the 8 KiB reference SRAM ($6000-$7FFF) to a
+    // file at end of run. Used to identify code Mother copies to SRAM
+    // (JSR $6000) so it can be rooted/translated like ROM code.
+    if let Ok(path) = std::env::var("FD_DUMP_SRAM") {
+        if let Err(e) = std::fs::write(&path, &bus.sram) {
+            eprintln!("FD_DUMP_SRAM failed: {e}");
+        } else {
+            let nonzero = bus.sram.iter().filter(|&&b| b != 0).count();
+            eprintln!("FD_DUMP_SRAM wrote {path} ({nonzero} nonzero bytes)");
         }
     }
     eprintln!(
@@ -1263,7 +1615,21 @@ impl z80_emu::Bus for SmsBus {
 fn sms_dc_to_nes(dc: u8, title_mode: bool) -> u8 {
     let pressed = !dc;
     let mut nes = 0u8;
-    if title_mode {
+    // FD_PAD_BOTH=1: harvest stimulus for games (e.g. Mother) whose RAM
+    // never sets SMB's $0770 title flag, so the title/gameplay split below
+    // can never yield both START and A in one run. Each face bit drives
+    // both of its roles at once (A+Select, B+Start); the ROM only responds
+    // to whatever it actually polls, so harvested (bank, target) pairs stay
+    // ground truth. Reference-side stimulus only — never the subject, and
+    // never a profile fact.
+    if std::env::var("FD_PAD_BOTH").is_ok() {
+        if pressed & (1 << 4) != 0 {
+            nes |= Buttons::A | Buttons::SELECT;
+        }
+        if pressed & (1 << 5) != 0 {
+            nes |= Buttons::B | Buttons::START;
+        }
+    } else if title_mode {
         if pressed & (1 << 4) != 0 {
             nes |= Buttons::SELECT;
         }
@@ -1964,6 +2330,11 @@ fn main() {
     let image = nes_rom::parse(&nes).expect("parse nes");
     let mapper_policy = nes_rom::resolve_mapper_policy(&image.header, image.prg.len())
         .expect("supported mapper policy");
+    if matches!(mapper_policy, nes_rom::MapperPolicy::Mmc3 { .. }) {
+        eprintln!(
+            "Reference MMC3 support: PRG windows + CHR banking + SRAM + mirroring + scanline-IRQ pacing (approx 1 line per 32 insn, FD_MMC3_STEPS_PER_SCANLINE; A12 gated on rendering + $1000 pattern use)"
+        );
+    }
     let prg = image.prg.to_vec();
 
     let (timeline, script_desc) = if let Some(path) = buttons_script {

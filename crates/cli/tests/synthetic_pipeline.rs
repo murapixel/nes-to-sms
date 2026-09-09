@@ -1012,6 +1012,80 @@ fn oracle_and_z80_emu_agree_on_smb_pointer_increment_slice() {
     }
 }
 
+/// Minimal 64 KiB (8x8 KiB) MMC3 image: NOP fill, a 3-byte routine at
+/// bank-0 `$8000`, reset code at fixed `$C000`, vectors pointing at `$C000`.
+fn build_mmc3_discovery_rom() -> Vec<u8> {
+    const BANK8: usize = 8 * 1024;
+    let mut prg = vec![0xEAu8; 8 * BANK8];
+    prg[0..3].copy_from_slice(&[0xA9, 0x01, 0x60]); // LDA #1; RTS at $8000
+    let fixed = 7 * BANK8; // last bank starts here; $C000 = prg[6*BANK8]
+    // Reset falls through NOP into a contiguous R6=5 + JSR $8000 idiom
+    // (walked as code, harvested as an UNVERIFIED candidate), then RTS.
+    prg[6 * BANK8] = 0xEA;
+    prg[6 * BANK8 + 1..6 * BANK8 + 14].copy_from_slice(&[
+        0xA9, 0x06, 0x8D, 0x00, 0x80, 0xA9, 0x05, 0x8D, 0x01, 0x80, 0x20, 0x00, 0x80,
+    ]);
+    prg[6 * BANK8 + 14] = 0x60;
+    prg[fixed + BANK8 - 6..fixed + BANK8 - 4].copy_from_slice(&0xC000u16.to_le_bytes());
+    prg[fixed + BANK8 - 4..fixed + BANK8 - 2].copy_from_slice(&0xC000u16.to_le_bytes());
+    prg[fixed + BANK8 - 2..fixed + BANK8].copy_from_slice(&0xC000u16.to_le_bytes());
+    let mut rom = vec![0u8; 16 + prg.len() + 8 * 1024];
+    rom[0..4].copy_from_slice(b"NES\x1a");
+    rom[4] = 4; // 4x16 KiB = 64 KiB PRG
+    rom[5] = 1; // 8 KiB CHR
+    rom[6] = 0x41; // mapper 4 (high nibble), vertical mirroring
+    rom[16..16 + prg.len()].copy_from_slice(&prg);
+    rom
+}
+
+fn write_mmc3_discovery_profile(path: &std::path::Path, rom: &[u8]) {
+    let image = nes_rom::parse(rom).unwrap();
+    std::fs::write(
+        path,
+        format!(
+            "[rom]\nname = \"mmc3-discovery\"\nmapper = 4\nprg_kib = 64\nchr_kib = 8\npayload_sha256 = \"{}\"\n\n[vectors]\nnmi = 0xc000\nreset = 0xc000\nirq = 0xc000\n\n[[function]]\naddr = 0xc000\nname = \"Reset\"\n\n[[bank_entry]]\nbank = 0\naddr = 0x8000\n",
+            nes_rom::payload_sha256_hex(image.prg, image.chr)
+        ),
+    )
+    .unwrap();
+}
+
+#[test]
+fn mmc3_pipeline_runs_discovery_only_and_reports() {
+    let rom = build_mmc3_discovery_rom();
+    let work = tmp("mmc3discovery");
+    let rom_path = work.join("rom.nes");
+    let prof_path = work.join("profile.toml");
+    let out_path = work.join("out");
+    std::fs::write(&rom_path, &rom).unwrap();
+    write_mmc3_discovery_profile(&prof_path, &rom);
+
+    let args = nes_to_sms_args(&rom_path, &prof_path, &out_path, None);
+    let err = run_pipeline(args).expect_err("MMC3 lowering is not wired yet");
+    assert!(
+        err.contains("discovery-only"),
+        "expected discovery-only diagnostic, got:\n{err}"
+    );
+    let discovery = std::fs::read_to_string(out_path.join("reports/discovery.txt"))
+        .expect("discovery report written");
+    assert!(
+        discovery.contains("fixed mode-0 top: 1 functions"),
+        "fixed pass missing:\n{discovery}"
+    );
+    assert!(
+        discovery.contains("window LOW  bank8=0: 1 functions"),
+        "window pass missing:\n{discovery}"
+    );
+    assert!(
+        discovery.contains("fixed -> window LOW  $8000"),
+        "fixed->window attack list missing:\n{discovery}"
+    );
+    assert!(
+        discovery.contains("CANDIDATE bank8=5 target=$8000"),
+        "static idiom candidate missing:\n{discovery}"
+    );
+}
+
 fn nes_to_sms_args(
     rom: &std::path::Path,
     profile: &std::path::Path,

@@ -355,6 +355,11 @@ pub enum Op {
     ApuRead {
         reg: u16,
     },
+    /// Constant-address store into PRG ROM space (`$8000-$FFFF`): a mapper
+    /// register write. The exact address is preserved so lowering can pass
+    /// it to `rt_mapper_write` — this covers UxROM's single register and
+    /// every MMC3 family (`$8000` select / `$8001` data / `$A000` / `$C000` /
+    /// `$E000`), with the runtime shim decoding the address.
     MapperWrite {
         addr: u16,
         value: ValueSrc,
@@ -1079,21 +1084,15 @@ fn lift_insn(
                             vec![Op::StaMem { addr, region }]
                         }
                     }
-                    MemRegion::Mapper | MemRegion::PrgRam => vec![Op::UnsupportedMapperStore {
+                    MemRegion::Mapper => vec![Op::UnsupportedMapperStore {
                         pc,
                         opcode: insn.opcode,
                         mnemonic: "STA".to_string(),
-                        reason: match region {
-                            MemRegion::Mapper => {
-                                "STA to expansion space ($4020-$5FFF) is not a supported UxROM mapper register"
-                            }
-                            MemRegion::PrgRam => {
-                                "STA to PRG RAM ($6000-$7FFF) is not a supported UxROM mapper register"
-                            }
-                            _ => unreachable!(),
-                        }
-                        .to_string(),
+                        reason: "STA to expansion space ($4020-$5FFF) has no mapper-register lowering (only $8000-$FFFF STA forms lower to rt_mapper_write)"
+                            .to_string(),
                     }],
+                    // SRAM stores lower through the EXRAM shims.
+                    MemRegion::PrgRam => vec![Op::StaMem { addr, region }],
                     _ => vec![Op::StaMem { addr, region }],
                 };
             }
@@ -1113,15 +1112,27 @@ fn lift_insn(
                         value: ValueSrc::X,
                     }],
                     MemRegion::OamDma => vec![Op::OamDmaWrite { value: ValueSrc::X }],
-                    MemRegion::Mapper | MemRegion::PrgRam | MemRegion::PrgRom => {
+                    MemRegion::PrgRom => {
+                        // STX to cartridge space is a mapper-register write
+                        // (MMC3 decodes ranges, so mirrors like STY $C734 hit
+                        // the IRQ latch). STX has no absolute-indexed form on
+                        // the 6502, so a PrgRom store is always constant.
+                        vec![Op::MapperWrite {
+                            addr: base,
+                            value: ValueSrc::X,
+                        }]
+                    }
+                    MemRegion::Mapper => {
                         vec![Op::UnsupportedMapperStore {
                             pc,
                             opcode: insn.opcode,
                             mnemonic: "STX".to_string(),
-                            reason: "STX to expansion space, PRG RAM, or PRG ROM is unsupported"
+                            reason: "STX to expansion space is unsupported"
                                 .to_string(),
                         }]
                     }
+                    // SRAM stores lower through the EXRAM shims.
+                    MemRegion::PrgRam => vec![Op::StxMem { addr, region }],
                     _ => vec![Op::StxMem { addr, region }],
                 };
             }
@@ -1141,15 +1152,27 @@ fn lift_insn(
                         value: ValueSrc::Y,
                     }],
                     MemRegion::OamDma => vec![Op::OamDmaWrite { value: ValueSrc::Y }],
-                    MemRegion::Mapper | MemRegion::PrgRam | MemRegion::PrgRom => {
+                    MemRegion::PrgRom => {
+                        // STY to cartridge space is a mapper-register write
+                        // (MMC3 decodes ranges: even $C000-$DFFF = IRQ latch,
+                        // so STY $C734 latches Y). STY has no
+                        // absolute-indexed form, so this is always constant.
+                        vec![Op::MapperWrite {
+                            addr: base,
+                            value: ValueSrc::Y,
+                        }]
+                    }
+                    MemRegion::Mapper => {
                         vec![Op::UnsupportedMapperStore {
                             pc,
                             opcode: insn.opcode,
                             mnemonic: "STY".to_string(),
-                            reason: "STY to expansion space, PRG RAM, or PRG ROM is unsupported"
+                            reason: "STY to expansion space is unsupported"
                                 .to_string(),
                         }]
                     }
+                    // SRAM stores lower through the EXRAM shims.
+                    MemRegion::PrgRam => vec![Op::StyMem { addr, region }],
                     _ => vec![Op::StyMem { addr, region }],
                 };
             }
@@ -2348,17 +2371,57 @@ mod tests {
             region: MemRegion::PrgRom,
         }));
 
-        for (bytes, mnemonic, range) in [
-            (&[0x8D, 0x20, 0x40][..], "STA", "expansion space"),
-            (&[0x8D, 0x00, 0x60][..], "STA", "PRG RAM"),
-            (&[0x8E, 0x00, 0x80][..], "STX", "PRG ROM"),
-            (&[0x8C, 0x00, 0x60][..], "STY", "PRG RAM"),
+        // STA to expansion space stays fail-closed; SRAM and STX/STY to
+        // cartridge space lower through real shims (EXRAM / rt_mapper_write
+        // with X/Y values — MMC3 decodes ranges, so STY $C734 latches Y).
+        let r = lift(0x8000, &[0x8D, 0x20, 0x40]);
+        assert!(r.ops.iter().any(|op| matches!(op,
+            Op::UnsupportedMapperStore { mnemonic, reason, .. }
+            if mnemonic == "STA" && reason.contains("expansion space")
+        )));
+        let r = lift(0x8000, &[0x8D, 0x00, 0x60]);
+        assert!(r.ops.contains(&Op::StaMem {
+            addr: AddrExpr::Const(0x6000),
+            region: MemRegion::PrgRam,
+        }));
+        let r = lift(0x8000, &[0x8E, 0x00, 0x80]);
+        assert!(r.ops.contains(&Op::MapperWrite {
+            addr: 0x8000,
+            value: ValueSrc::X,
+        }));
+        let r = lift(0x8000, &[0x8C, 0x00, 0x60]);
+        assert!(r.ops.contains(&Op::StyMem {
+            addr: AddrExpr::Const(0x6000),
+            region: MemRegion::PrgRam,
+        }));
+        // Zero-page-indexed STX/STY stay ordinary memory stores (the 6502
+        // has no absolute-indexed STX/STY forms, so PrgRom stores are
+        // always constant and always mapper writes).
+        let r = lift(0x8000, &[0x96, 0x10]);
+        assert!(r.ops.contains(&Op::StxMem {
+            addr: AddrExpr::ZpIndexedY(0x10),
+            region: MemRegion::ZeroPage,
+        }));
+    }
+
+    #[test]
+    fn lift_mmc3_family_stores_keep_exact_mapper_addresses() {
+        // Every MMC3 register family lifts to MapperWrite with its exact
+        // address, so the runtime shim can decode select/data/mirroring /
+        // IRQ / enable writes without further static analysis.
+        for addr in [
+            0x8000u16, 0x8001, 0xA000, 0xA001, 0xC000, 0xC001, 0xE000, 0xE001,
         ] {
-            let r = lift(0x8000, bytes);
-            assert!(r.ops.iter().any(|op| matches!(op,
-                Op::UnsupportedMapperStore { mnemonic: actual, reason, .. }
-                if actual == mnemonic && reason.contains(range)
-            )));
+            let lo = (addr & 0xFF) as u8;
+            let hi = (addr >> 8) as u8;
+            let r = lift(0xC000, &[0x8D, lo, hi]);
+            assert!(
+                r.ops.contains(&Op::MapperWrite {
+                    addr,
+                    value: ValueSrc::A,
+                }),
+                "STA ${addr:04X} must lift to an exact-address MapperWrite"
+            );
         }
     }
 

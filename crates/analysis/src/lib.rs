@@ -186,6 +186,27 @@ impl AnalysisWindow {
         start: 0xC000,
         end_inclusive: 0xFFFF,
     };
+    /// MMC3 low switchable window ($8000-$9FFF: R6 in PRG mode 0, the
+    /// second-last bank in PRG mode 1).
+    pub const SWITCHABLE_8K_LOW: Self = Self {
+        start: 0x8000,
+        end_inclusive: 0x9FFF,
+    };
+    /// MMC3 high switchable window ($A000-$BFFF: always R7).
+    pub const SWITCHABLE_8K_HIGH: Self = Self {
+        start: 0xA000,
+        end_inclusive: 0xBFFF,
+    };
+    /// MMC3 mode-independent fixed top ($E000-$FFFF: always the last bank).
+    /// `$C000-$DFFF` is fixed only in PRG mode 0, so mode-agnostic fixed
+    /// discovery must stay within this window.
+    pub const FIXED_8K_TOP: Self = Self {
+        start: 0xE000,
+        end_inclusive: 0xFFFF,
+    };
+
+    /// The two MMC3 switchable windows in CPU order.
+    pub const MMC3_SWITCHABLE: [Self; 2] = [Self::SWITCHABLE_8K_LOW, Self::SWITCHABLE_8K_HIGH];
 
     pub fn contains(self, addr: u16) -> bool {
         addr >= self.start && addr <= self.end_inclusive
@@ -885,6 +906,77 @@ chr_kib = 8
         assert!(f.external_refs.contains(&0xC000));
         assert!(result.functions.by_addr(0xC000).is_none());
         assert_eq!(result.class_map.class_at(0x4000), ByteClass::Unknown);
+    }
+
+    #[test]
+    fn mmc3_window_geometry_partitions_prg() {
+        use AnalysisWindow as W;
+        // The two 8 KiB switchable windows exactly tile the UxROM 16 KiB
+        // switchable range, with no overlap and no gap.
+        assert_eq!(W::SWITCHABLE_8K_LOW.start, 0x8000);
+        assert_eq!(W::SWITCHABLE_8K_LOW.end_inclusive, 0x9FFF);
+        assert_eq!(W::SWITCHABLE_8K_HIGH.start, 0xA000);
+        assert_eq!(W::SWITCHABLE_8K_HIGH.end_inclusive, 0xBFFF);
+        assert_eq!(W::MMC3_SWITCHABLE.len(), 2);
+        for addr in [0x8000, 0x9FFF] {
+            assert!(W::SWITCHABLE_8K_LOW.contains(addr));
+            assert!(!W::SWITCHABLE_8K_HIGH.contains(addr));
+        }
+        for addr in [0xA000, 0xBFFF] {
+            assert!(W::SWITCHABLE_8K_HIGH.contains(addr));
+            assert!(!W::SWITCHABLE_8K_LOW.contains(addr));
+        }
+        assert!(!W::SWITCHABLE_8K_LOW.contains(0x7FFF));
+        assert!(!W::SWITCHABLE_8K_HIGH.contains(0xC000));
+        // Mode-independent fixed top is the last 8 KiB of the fixed 16 KiB
+        // range ($C000-$DFFF is only fixed in PRG mode 0).
+        assert!(W::FIXED_16K.contains(0xC000));
+        assert!(W::FIXED_16K.contains(0xFFFF));
+        assert_eq!(W::FIXED_8K_TOP.start, 0xE000);
+        assert_eq!(W::FIXED_8K_TOP.end_inclusive, 0xFFFF);
+        assert!(!W::FIXED_8K_TOP.contains(0xDFFF));
+        for addr in [0xE000, 0xFFFF] {
+            assert!(W::FIXED_8K_TOP.contains(addr));
+            assert!(W::FIXED_16K.contains(addr));
+        }
+    }
+
+    #[test]
+    fn mmc3_windowed_views_isolate_low_and_high() {
+        // NROM-shaped MMC3 view: low8 | high8 | fixed16.
+        // Low half at $8000: JSR $A100; RTS. High half at $A100: LDA #1; RTS.
+        let mut view = vec![0xFFu8; 0x8000];
+        view[0x0000..0x0004].copy_from_slice(&[0x20, 0x00, 0xA1, 0x60]);
+        view[0x2100..0x2103].copy_from_slice(&[0xA9, 0x01, 0x60]);
+        view[0x4000..0x4003].copy_from_slice(&[0xA9, 0x02, 0x60]);
+        view[0x6000..0x6003].copy_from_slice(&[0xA9, 0x03, 0x60]);
+        let profile = minimal_profile();
+
+        // Low-window pass: $8000 found, cross-window JSR stays external,
+        // high/fixed bytes untouched by this pass.
+        let low = analyze_in_window(
+            &view,
+            vectors_reset(0x8000),
+            &profile,
+            AnalysisWindow::SWITCHABLE_8K_LOW,
+            Some(2),
+        );
+        let f = low.functions.by_addr(0x8000).expect("low root");
+        assert!(f.external_refs.contains(&0xA100));
+        assert!(low.functions.by_addr(0xA100).is_none());
+        assert_eq!(low.class_map.class_at(0x2100), ByteClass::Unknown);
+
+        // High-window pass: $A100 found with exact bounds.
+        let high = analyze_in_window(
+            &view,
+            vectors_reset(0xA100),
+            &profile,
+            AnalysisWindow::SWITCHABLE_8K_HIGH,
+            Some(5),
+        );
+        let g = high.functions.by_addr(0xA100).expect("high root");
+        assert_eq!(g.end, 0xA103);
+        assert!(high.functions.by_addr(0x8000).is_none());
     }
 
     #[test]

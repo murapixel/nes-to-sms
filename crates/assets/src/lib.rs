@@ -3,6 +3,8 @@
 //! Converts NES graphics assets (CHR tiles, palettes, nametables) into
 //! SMS Mode 4-compatible formats and produces diagnostic PPM tile sheets.
 
+use std::fmt;
+
 // Canonical 2C02 NES master palette in 24-bit RGB (64 entries, index 0x00 first).
 const NES_MASTER_PALETTE: [(u8, u8, u8); 64] = [
     (84, 84, 84),
@@ -104,6 +106,59 @@ pub fn nes_chr_to_sms_4bpp(chr: &[u8]) -> Vec<u8> {
 /// Compute the SMS Mode 4 4bpp tile count produced for a given CHR byte length.
 pub fn sms_tile_count(chr_len: usize) -> usize {
     chr_len / 16
+}
+
+/// MMC3 CHR-ROM banking granularity: 1 KiB banks of 64 tiles. R2-R5 select
+/// single 1 KiB banks; R0/R1 select 2 KiB pairs (even bank + following bank).
+pub const MMC3_CHR_BANK_SIZE: usize = 1024;
+/// MMC3 CHR capacity: at most 256 1 KiB banks (256 KiB).
+pub const MMC3_MAX_CHR_1K_BANKS: usize = 256;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mmc3ChrLayoutError {
+    NotMultipleOf1K { len: usize },
+    TooManyBanks { banks: usize },
+}
+
+impl fmt::Display for Mmc3ChrLayoutError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotMultipleOf1K { len } => write!(
+                f,
+                "invalid MMC3 CHR layout: length must be a multiple of 1 KiB, got {len} bytes"
+            ),
+            Self::TooManyBanks { banks } => write!(
+                f,
+                "invalid MMC3 CHR layout: at most {MMC3_MAX_CHR_1K_BANKS} 1 KiB banks, got {banks}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for Mmc3ChrLayoutError {}
+
+/// Convert MMC3 CHR-ROM into one SMS 4bpp blob per 1 KiB bank, bank order
+/// preserved: `blobs[b][t * 32..]` is the SMS tile for NES 1 KiB-bank `b`,
+/// tile-in-bank `t`.
+///
+/// Runtime contract (see the M3 CHR-banking plan): the R0-R5 + CHR-invert
+/// state resolves to `(bank, tile)` pairs and uploads whole blobs on window
+/// switches. Tile order within a blob never changes, so an SMS slot for a
+/// live tile is `blob_base + tile_in_bank`, and 2 KiB windows (R0/R1) are
+/// just two consecutive blobs. Fails closed on non-1 KiB-aligned or
+/// over-capacity CHR instead of emitting a truncated bank set.
+pub fn mmc3_chr_banks_to_sms_4bpp(chr: &[u8]) -> Result<Vec<Vec<u8>>, Mmc3ChrLayoutError> {
+    if chr.len() % MMC3_CHR_BANK_SIZE != 0 {
+        return Err(Mmc3ChrLayoutError::NotMultipleOf1K { len: chr.len() });
+    }
+    let banks = chr.len() / MMC3_CHR_BANK_SIZE;
+    if banks > MMC3_MAX_CHR_1K_BANKS {
+        return Err(Mmc3ChrLayoutError::TooManyBanks { banks });
+    }
+    Ok(chr
+        .chunks(MMC3_CHR_BANK_SIZE)
+        .map(nes_chr_to_sms_4bpp)
+        .collect())
 }
 
 /// Grayscale palette for PPM rendering: pixel value → (R, G, B).
@@ -225,6 +280,40 @@ mod tests {
     #[test]
     fn empty_chr_produces_empty_output() {
         assert_eq!(nes_chr_to_sms_4bpp(&[]), Vec::<u8>::new());
+    }
+
+    // --- mmc3_chr_banks_to_sms_4bpp ---
+
+    #[test]
+    fn mmc3_banks_preserve_order_and_tile_layout() {
+        // EarthBound-like 128 KiB CHR = 128 1 KiB banks. Stamp bank 3 with
+        // a marker tile and prove it lands at blob[3], tile 5, row 0.
+        let mut chr = vec![0u8; 128 * MMC3_CHR_BANK_SIZE];
+        chr[3 * MMC3_CHR_BANK_SIZE + 5 * 16] = 0xFF; // bank 3, tile 5, p0 row0
+        let blobs = mmc3_chr_banks_to_sms_4bpp(&chr).unwrap();
+        assert_eq!(blobs.len(), 128);
+        assert!(blobs.iter().all(|b| b.len() == 64 * 32));
+        assert_eq!(&blobs[3][5 * 32..5 * 32 + 4], &[0xFF, 0x00, 0x00, 0x00]);
+        assert!(blobs[2].iter().all(|&b| b == 0));
+        assert!(blobs[4].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn mmc3_banks_reject_bad_layouts() {
+        assert_eq!(
+            mmc3_chr_banks_to_sms_4bpp(&vec![0u8; 1000]),
+            Err(Mmc3ChrLayoutError::NotMultipleOf1K { len: 1000 })
+        );
+        let banks = MMC3_MAX_CHR_1K_BANKS + 1;
+        assert_eq!(
+            mmc3_chr_banks_to_sms_4bpp(&vec![0u8; banks * MMC3_CHR_BANK_SIZE]),
+            Err(Mmc3ChrLayoutError::TooManyBanks { banks })
+        );
+        // Empty CHR is zero banks: valid, no blobs.
+        assert_eq!(
+            mmc3_chr_banks_to_sms_4bpp(&[]).unwrap(),
+            Vec::<Vec<u8>>::new()
+        );
     }
 
     #[test]

@@ -25,6 +25,12 @@
 
 .section "dispatch" free
 
+; TEMPORARY deadlock diagnostic (Mother $FDBB waits): a bare `ret` hook so
+; a profile [[replacement]] can stub waits with `call hook / ret`. REVERT
+; after diagnosis (unfaithful if kept: breaks task synchronization).
+rt_probe_ret2:
+  ret
+
 .define FAR_BANK_STACK_BASE $d4c0
 .define FAR_BANK_STACK_PTR  $d47d
 .define TR_RET_BASE         $d300
@@ -870,9 +876,25 @@ _btd_check_bank:
   cp   $ff
   jr   z, _btd_hit
   ld   c, a
+.ifdef NES_MMC3
+  ; MMC3 has two independent windows sharing no single live-bank shadow:
+  ; resolve against the LOW/HIGH shadow for the target's window. The
+  ; requested target high byte is in ($CB1C).
+  ld   a, ($cb1c)
+  cp   $a0
+  jr   c, _btd_mmc3_low
+  ld   a, (MMC3_PRG_HIGH)
+  jr   _btd_mmc3_cmp
+_btd_mmc3_low:
+  ld   a, (MMC3_PRG_LOW)
+_btd_mmc3_cmp:
+  cp   c
+  jr   z, _btd_hit
+.else
   ld   a, ($cb62)
   cp   c
   jr   z, _btd_hit
+.endif
 _btd_skip:
   inc  hl
   inc  hl
@@ -1039,8 +1061,15 @@ _btd_trap:
   add  a, NES_PRG_BANK_BASE
   cp   b
 .else
+.ifdef NES_MMC3
+  ld   a, (MMC3_PRG_LOW)
+  srl  a
+  add  a, NES_MMC3_PRG_BASE
+  cp   b
+.else
   ld   a, :data_prg_low
   cp   b
+.endif
 .endif
   jp   nz, _btd_slot2_bad
   ; Locked map to fixed PRG; no calls/pushes in this transaction.
@@ -1073,7 +1102,13 @@ _btd_walk_none:
   and  NES_PRG_BANK_MASK
   add  a, NES_PRG_BANK_BASE
 .else
+.ifdef NES_MMC3
+  ld   a, (MMC3_PRG_LOW)
+  srl  a
+  add  a, NES_MMC3_PRG_BASE
+.else
   ld   a, :data_prg_low
+.endif
 .endif
   ld   ($ffff), a
   jr   _btd_trap_flash
@@ -1086,7 +1121,13 @@ _btd_walk_found:
   and  NES_PRG_BANK_MASK
   add  a, NES_PRG_BANK_BASE
 .else
+.ifdef NES_MMC3
+  ld   a, (MMC3_PRG_LOW)
+  srl  a
+  add  a, NES_MMC3_PRG_BASE
+.else
   ld   a, :data_prg_low
+.endif
 .endif
   ld   ($ffff), a
   ld   a, h
@@ -1476,6 +1517,11 @@ rt_read_indexed:
 ; Entry HL = effective NES $C000-$FFFF. Exit A = byte; preserves C/DE.
 ; The fixed high image is mapped only for this outer transaction.
 rt_read_prg_high:
+.ifdef NES_MMC3
+  ; MMC3 fixed reads are mode-aware ($C000-$DFFF follows R6 in PRG mode 1);
+  ; handled in mapper_mmc3.s. Same entry contract (HL=$C000-$FFFF).
+  jp  rt_mmc3_read_fixed
+.endif
   ld   a, h
   cp   $c0
   jp   c, _rph_bad
@@ -1492,8 +1538,13 @@ rt_read_prg_high:
   sub  $40
   ld   h, a
   ld   b, (hl)
+.ifdef NES_MMC3
+  ; Canonical slot-2 image is the LOW pair, not data_prg_low (absent).
+  call rt_restore_prg_window
+.else
   ld   a, :data_prg_low
   ld   ($ffff), a
+.endif
   ld   a, b
   ret
 .else

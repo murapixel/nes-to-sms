@@ -78,6 +78,18 @@ pub mod runtime_symbols {
     pub const WRITE_INDEXED: &str = "rt_write_indexed";
     pub const READ_ZP_PTR_Y: &str = "rt_read_zp_ptr_y";
     pub const WRITE_ZP_PTR_Y: &str = "rt_write_zp_ptr_y";
+    /// MMC3 (mapper 4) switchable-window read: HL = NES $8000-$BFFF.
+    pub const MMC3_READ_WINDOW: &str = "rt_mmc3_read_window";
+    /// MMC3 switchable-window indexed read: HL = base, B = offset.
+    pub const MMC3_READ_WINDOW_INDEXED: &str = "rt_mmc3_read_window_indexed";
+    /// NES SRAM ($6000-$7FFF) over SMS EXRAM: HL = address.
+    pub const SRAM_READ: &str = "rt_sram_read";
+    /// NES SRAM store: HL = address, A = value.
+    pub const SRAM_WRITE: &str = "rt_sram_write";
+    /// SRAM indexed read: HL = base, B = offset.
+    pub const SRAM_READ_INDEXED: &str = "rt_sram_read_indexed";
+    /// SRAM indexed store: HL = base, B = offset, C = value.
+    pub const SRAM_WRITE_INDEXED: &str = "rt_sram_write_indexed";
     pub const ASL_A: &str = "rt_asl_a";
     pub const ASL_MEM: &str = "rt_asl_mem";
     pub const LSR_A: &str = "rt_lsr_a";
@@ -198,11 +210,27 @@ fn indexed_base_to_sms(base: u16, region: ir::MemRegion) -> u16 {
     }
 }
 
-fn indexed_read_runtime(base: u16, region: ir::MemRegion) -> &'static str {
+fn indexed_read_runtime(base: u16, region: ir::MemRegion, mmc3_windowed: bool) -> &'static str {
     if region == ir::MemRegion::PrgRom && base >= 0xC000 {
         runtime_symbols::READ_PRG_HIGH_INDEXED
+    } else if mmc3_windowed && region == ir::MemRegion::PrgRom {
+        // MMC3: the $8000-$BFFF windows show live banks, never the slot-2
+        // image — resolve against the shadows per read.
+        runtime_symbols::MMC3_READ_WINDOW_INDEXED
+    } else if mmc3_windowed && region == ir::MemRegion::PrgRam {
+        // MMC3: $6000-$7FFF lives in SMS EXRAM, not the RAM mirror.
+        runtime_symbols::SRAM_READ_INDEXED
     } else {
         runtime_symbols::ROUTE_INDEXED
+    }
+}
+
+/// Indexed-store helper twin of [`indexed_read_runtime`].
+fn indexed_write_runtime(_base: u16, region: ir::MemRegion, mmc3_windowed: bool) -> &'static str {
+    if mmc3_windowed && region == ir::MemRegion::PrgRam {
+        runtime_symbols::SRAM_WRITE_INDEXED
+    } else {
+        runtime_symbols::WRITE_INDEXED
     }
 }
 
@@ -256,14 +284,20 @@ fn indexed_plain_ram_base(base: u16, region: ir::MemRegion) -> Option<u16> {
 }
 
 /// PRG bases whose whole `base+$FF` span stays inside the always-mapped
-/// low window ($8000-$BFFF in slot 2): direct read, no banking.
-fn indexed_plain_prg_low(base: u16, region: ir::MemRegion) -> Option<u16> {
+/// low window ($8000-$BFFF in slot 2): direct read, no banking. MMC3 is
+/// excluded: its two windows show independent live banks, so every window
+/// read resolves against the shadows through a helper.
+fn indexed_plain_prg_low(base: u16, region: ir::MemRegion, mmc3_windowed: bool) -> Option<u16> {
+    if mmc3_windowed {
+        return None;
+    }
     (region == ir::MemRegion::PrgRom && (0x8000..=0xBF00).contains(&base)).then_some(base)
 }
 
 /// Either of the two direct-read windows.
-fn indexed_direct_base(base: u16, region: ir::MemRegion) -> Option<u16> {
-    indexed_plain_ram_base(base, region).or_else(|| indexed_plain_prg_low(base, region))
+fn indexed_direct_base(base: u16, region: ir::MemRegion, mmc3_windowed: bool) -> Option<u16> {
+    indexed_plain_ram_base(base, region)
+        .or_else(|| indexed_plain_prg_low(base, region, mmc3_windowed))
 }
 
 /// Fixed-high PRG read. Mapper 2 must restore the exact selected window through
@@ -679,6 +713,7 @@ fn emit_ldxy_mem(
     region: ir::MemRegion,
     target: IdxReg,
     guarded_mapper_window: bool,
+    mmc3_windowed: bool,
 ) {
     use ir::{AddrExpr, MemRegion};
     // Keep translated LDX/LDY memory loads off the native Z80 stack. The old
@@ -703,14 +738,31 @@ fn emit_ldxy_mem(
             }
         }
         (AddrExpr::Const(a), MemRegion::PrgRom) if *a < 0xC000 => {
-            program.ld_a_abs(*a);
+            if mmc3_windowed {
+                // MMC3: no direct window — resolve against the live shadows.
+                program.ld_hl_imm(*a);
+                program.call(runtime_symbols::MMC3_READ_WINDOW);
+            } else {
+                program.ld_a_abs(*a);
+            }
+        }
+        (AddrExpr::Const(a), MemRegion::PrgRam) => {
+            // NES SRAM over SMS EXRAM (all mappers share the shim; NROM
+            // games simply never execute it).
+            program.ld_hl_imm(*a);
+            program.call(runtime_symbols::SRAM_READ);
         }
         (AddrExpr::Const(a), MemRegion::PrgRom) => {
             emit_prg_high_read_direct(program, *a, guarded_mapper_window);
         }
         (AddrExpr::AbsIndexedX(base), _) => {
-            if let Some(sms) = indexed_direct_base(*base, region) {
+            if let Some(sms) = indexed_direct_base(*base, region, mmc3_windowed) {
                 emit_indexed_read_direct(program, sms, IdxReg::X);
+            } else if mmc3_windowed && region == ir::MemRegion::PrgRam {
+                program.ld_hl_imm(indexed_base_to_sms(*base, region));
+                program.ld_a_d();
+                program.ld_b_a();
+                program.call(runtime_symbols::SRAM_READ_INDEXED);
             } else {
                 if region == ir::MemRegion::PrgRom && *base >= 0xC000 {
                     emit_prg_high_indexed_direct(program, *base, IdxReg::X, guarded_mapper_window);
@@ -718,13 +770,18 @@ fn emit_ldxy_mem(
                     program.ld_hl_imm(indexed_base_to_sms(*base, region));
                     program.ld_a_d();
                     program.ld_b_a();
-                    program.call(indexed_read_runtime(*base, region));
+                    program.call(indexed_read_runtime(*base, region, mmc3_windowed));
                 }
             }
         }
         (AddrExpr::AbsIndexedY(base), _) => {
-            if let Some(sms) = indexed_direct_base(*base, region) {
+            if let Some(sms) = indexed_direct_base(*base, region, mmc3_windowed) {
                 emit_indexed_read_direct(program, sms, IdxReg::Y);
+            } else if mmc3_windowed && region == ir::MemRegion::PrgRam {
+                program.ld_hl_imm(indexed_base_to_sms(*base, region));
+                program.ld_a_e_reg();
+                program.ld_b_a();
+                program.call(runtime_symbols::SRAM_READ_INDEXED);
             } else {
                 if region == ir::MemRegion::PrgRom && *base >= 0xC000 {
                     emit_prg_high_indexed_direct(program, *base, IdxReg::Y, guarded_mapper_window);
@@ -732,7 +789,7 @@ fn emit_ldxy_mem(
                     program.ld_hl_imm(indexed_base_to_sms(*base, region));
                     program.ld_a_e_reg();
                     program.ld_b_a();
-                    program.call(indexed_read_runtime(*base, region));
+                    program.call(indexed_read_runtime(*base, region, mmc3_windowed));
                 }
             }
         }
@@ -799,6 +856,7 @@ fn emit_stxy_mem(
     addr: &ir::AddrExpr,
     region: ir::MemRegion,
     src: IdxReg,
+    mmc3_windowed: bool,
 ) {
     use ir::{AddrExpr, MemRegion};
     program.push_af();
@@ -814,7 +872,7 @@ fn emit_stxy_mem(
         (AddrExpr::AbsIndexedX(base), _) => {
             // Load X/Y into the value, also load X (index) — but the value
             // and the index can be the same shadow byte. Use C as scratch.
-            if let Some(sms) = indexed_direct_base(*base, region) {
+            if let Some(sms) = indexed_direct_base(*base, region, mmc3_windowed) {
                 src.load_into_a(program);
                 emit_indexed_write_direct(program, sms, IdxReg::X);
             } else {
@@ -824,11 +882,11 @@ fn emit_stxy_mem(
                 program.ld_a_d();
                 program.ld_b_a();
                 program.ld_a_c();
-                program.call(runtime_symbols::WRITE_INDEXED);
+                program.call(indexed_write_runtime(*base, region, mmc3_windowed));
             }
         }
         (AddrExpr::AbsIndexedY(base), _) => {
-            if let Some(sms) = indexed_direct_base(*base, region) {
+            if let Some(sms) = indexed_direct_base(*base, region, mmc3_windowed) {
                 src.load_into_a(program);
                 emit_indexed_write_direct(program, sms, IdxReg::Y);
             } else {
@@ -838,7 +896,7 @@ fn emit_stxy_mem(
                 program.ld_a_e_reg();
                 program.ld_b_a();
                 program.ld_a_c();
-                program.call(runtime_symbols::WRITE_INDEXED);
+                program.call(indexed_write_runtime(*base, region, mmc3_windowed));
             }
         }
         (AddrExpr::ZpIndexedX(zp), _) => {
@@ -874,6 +932,12 @@ fn emit_stxy_mem(
             src.load_into_a(program);
             program.ld_b_imm((*a & 7) as u8);
             program.call(runtime_symbols::PPU_WRITE);
+        }
+        (AddrExpr::Const(a), MemRegion::PrgRam) => {
+            // STX/STY to NES SRAM (value-preserving: push/pop AF brackets).
+            src.load_into_a(program);
+            program.ld_hl_imm(*a);
+            program.call(runtime_symbols::SRAM_WRITE);
         }
         _ => {
             program.comment("WARN: unresolved STX/STY addressing mode");
@@ -1391,6 +1455,7 @@ fn emit_mem_to_b_with_mode(
     addr: &ir::AddrExpr,
     region: ir::MemRegion,
     guarded_mapper_window: bool,
+    mmc3_windowed: bool,
 ) {
     use ir::{AddrExpr, MemRegion};
     use runtime_symbols::*;
@@ -1407,9 +1472,38 @@ fn emit_mem_to_b_with_mode(
     }
 
     match addr {
+        AddrExpr::Const(a) if region == MemRegion::PpuReg && (*a & 0x0007) == 2 => {
+            // BIT / ALU operand from PPUSTATUS ($2002): the full inline
+            // read into A (VBlank + sprite-0 phases, toggle resets), then
+            // into B with the accumulator restored. Stack-bracketed: no
+            // branches inside, so push/pop balance trivially. Without this
+            // arm BIT $2002 read B=0 and VBlank waits spun forever
+            // (Mother's reset/NMI prologues BIT $2002 four times).
+            p.push_af();
+            emit_ppu_status_read_inline(p);
+            p.ld_b_a();
+            p.pop_af();
+        }
         AddrExpr::Const(a) if region == MemRegion::PrgRom && *a < 0xC000 => {
+            if mmc3_windowed {
+                // MMC3: resolve against the live shadows (A preserved via C).
+                p.ld_c_a();
+                p.ld_hl_imm(*a);
+                p.call(MMC3_READ_WINDOW);
+                p.ld_b_a();
+                p.ld_a_c();
+            } else {
+                p.ld_hl_imm(*a);
+                p.ld_b_hl_ptr();
+            }
+        }
+        AddrExpr::Const(a) if region == MemRegion::PrgRam => {
+            // SRAM over EXRAM (A preserved via C).
+            p.ld_c_a();
             p.ld_hl_imm(*a);
-            p.ld_b_hl_ptr();
+            p.call(SRAM_READ);
+            p.ld_b_a();
+            p.ld_a_c();
         }
         AddrExpr::Const(a) if region == MemRegion::PrgRom => {
             if guarded_mapper_window {
@@ -1427,7 +1521,7 @@ fn emit_mem_to_b_with_mode(
         AddrExpr::AbsIndexedX(base) => {
             // For indexed reads we must preserve A across the read (the
             // operand lands in B). Save A in C, read, restore.
-            if let Some(sms) = indexed_direct_base(*base, region) {
+            if let Some(sms) = indexed_direct_base(*base, region, mmc3_windowed) {
                 p.ld_c_a();
                 p.ld_hl_imm(sms);
                 p.ld_a_d();
@@ -1459,13 +1553,13 @@ fn emit_mem_to_b_with_mode(
                 p.ld_hl_imm(indexed_base_to_sms(*base, region));
                 p.ld_a_d();
                 p.ld_b_a();
-                p.call(indexed_read_runtime(*base, region));
+                p.call(indexed_read_runtime(*base, region, mmc3_windowed));
                 p.ld_b_a();
                 p.pop_af();
             }
         }
         AddrExpr::AbsIndexedY(base) => {
-            if let Some(sms) = indexed_direct_base(*base, region) {
+            if let Some(sms) = indexed_direct_base(*base, region, mmc3_windowed) {
                 p.ld_c_a();
                 p.ld_hl_imm(sms);
                 p.ld_a_e_reg();
@@ -1495,7 +1589,7 @@ fn emit_mem_to_b_with_mode(
                 p.ld_hl_imm(indexed_base_to_sms(*base, region));
                 p.ld_a_e_reg();
                 p.ld_b_a();
-                p.call(indexed_read_runtime(*base, region));
+                p.call(indexed_read_runtime(*base, region, mmc3_windowed));
                 p.ld_b_a();
                 p.pop_af();
             }
@@ -1558,6 +1652,13 @@ fn emit_hl_for_rw_mem(p: &mut z80_emit::Program, addr: &ir::AddrExpr, region: ir
         AddrExpr::Const(a) if region == MemRegion::Ram || region == MemRegion::RamMirror => {
             p.ld_hl_imm(nes_ram_addr_to_sms(*a));
         }
+        // NES SRAM ($6000-$7FFF) over SMS EXRAM: the address is numerically
+        // identical; helpers take it in HL. Read-modify-write sites branch
+        // to the SRAM sequence (direct `(hl)` access would hit the RAM
+        // mirror or open bus).
+        AddrExpr::Const(a) if region == MemRegion::PrgRam => {
+            p.ld_hl_imm(*a);
+        }
         AddrExpr::AbsIndexedX(base) => {
             // Resident X is D: build the EA without touching A (native
             // flags are clobbered, as everywhere between IR ops).
@@ -1593,6 +1694,121 @@ fn emit_hl_for_rw_mem(p: &mut z80_emit::Program, addr: &ir::AddrExpr, region: ir
             p.ld_hl_imm(0x0000);
         }
     }
+}
+
+/// SRAM ($6000-$7FFF) INC/DEC over the EXRAM helpers.
+///
+/// Direct `(hl)` access cannot reach SRAM, so the modify goes through
+/// rt_sram_read + native inc/dec + rt_sram_write with caller A spilled to
+/// the designated RAM byte (LD: flag-safe and branch-safe — the native
+/// stack is unusable here because fused branches would break its balance).
+/// The store precedes any fused branches so every path observes the write;
+/// fused N/Z is then re-derived with `or a` (INC/DEC fusion only ever
+/// holds NZ conds — see nz_cond_to_z80 — so trashing native C is safe).
+/// Shadow flags mirror the direct path exactly: fused or flag-dead sites
+/// skip the shadow write, live sites commit via rt_set_nz_a.
+#[allow(clippy::too_many_arguments)]
+fn emit_sram_inc_dec(
+    p: &mut z80_emit::Program,
+    routine: &ir::Routine,
+    ops_slice: &[ir::Op],
+    op_idx: usize,
+    is_inc: bool,
+    fused_end: Option<usize>,
+    reads: Option<&std::collections::HashMap<String, u8>>,
+    emit_comments: bool,
+) {
+    use runtime_symbols::*;
+    use sms_layout::*;
+    // HL already holds the SRAM address (emit_hl_for_rw_mem by the caller).
+    p.ld_abs_a(LOWER_SAVED_A); // spill caller A
+    p.call(SRAM_READ); // A = old
+    if is_inc {
+        p.inc_a();
+    } else {
+        p.dec_a();
+    }
+    p.ld_c_a(); // park new
+    p.ld_a_c();
+    p.call(SRAM_WRITE); // store first: all fused paths observe it
+    if fused_end.is_none() && flags_live_after(ops_slice, op_idx, F_N | F_Z, reads) {
+        p.ld_a_c();
+        p.call(SET_NZ_A); // shadow N/Z (A preserved)
+    }
+    if let Some(end) = fused_end {
+        p.ld_a_c();
+        p.or_a(); // native N/Z from result (C dead in NZ-fusion)
+        emit_fused_branches(
+            p,
+            routine,
+            ops_slice,
+            op_idx + 1,
+            end,
+            emit_comments,
+            nz_cond_to_z80,
+        );
+    }
+    p.ld_a_abs(LOWER_SAVED_A); // restore caller A (LD: flags safe)
+}
+
+/// SRAM ($6000-$7FFF) shifts (ASL/LSR/ROL/ROR mem) over the EXRAM helpers.
+///
+/// The A-shift helper both produces the result and commits the exact
+/// shadow N/Z/C (consuming shadow C for ROL/ROR, like the direct path's
+/// rrca trick). Unfused sites need nothing more (no native flag readers
+/// exist outside fusion). Fused sites can read Carry (direct_cond_to_z80
+/// maps C/Nc), so native S/Z/C are rebuilt exactly: N/Z via `or a`, then
+/// C from the helper-written shadow via conditional `scf` (`scf`, like
+/// `or a`'s C=0, preserves S/Z — plain ALU tests cannot do this).
+#[allow(clippy::too_many_arguments)]
+fn emit_sram_shift(
+    p: &mut z80_emit::Program,
+    routine: &ir::Routine,
+    ops_slice: &[ir::Op],
+    op_idx: usize,
+    shift_helper: &str,
+    fused_end: Option<usize>,
+    emit_comments: bool,
+) {
+    use runtime_symbols::*;
+    use sms_layout::*;
+    // HL already holds the SRAM address (emit_hl_for_rw_mem by the caller).
+    p.ld_abs_a(LOWER_SAVED_A); // spill caller A
+    p.call(SRAM_READ); // A = old
+    p.call(shift_helper); // A = new, shadows N/Z/C exact
+    p.ld_c_a(); // park new
+    p.ld_a_c();
+    p.call(SRAM_WRITE); // store first: all fused paths observe it
+    if let Some(end) = fused_end {
+        let no_scf = p.fresh_label("sram_shift_no_scf");
+        let done = p.fresh_label("sram_shift_done");
+        p.ld_a_abs(SHADOW_P);
+        p.and_imm(0x01);
+        p.ld_b_a(); // B = carry-out (flags disposable here)
+        p.ld_a_c();
+        p.or_a(); // N/Z of result, C=0
+        p.ld_a_b();
+        p.or_a(); // Z = !carry (S/Z disposable here)
+        p.jr_z(&no_scf);
+        p.ld_a_c();
+        p.or_a(); // N/Z of result, C=0
+        p.scf(); // C=1, S/Z preserved
+        p.jr(&done);
+        p.label(&no_scf);
+        p.ld_a_c();
+        p.or_a(); // N/Z of result, C=0
+        p.label(&done);
+        emit_fused_branches(
+            p,
+            routine,
+            ops_slice,
+            op_idx + 1,
+            end,
+            emit_comments,
+            direct_cond_to_z80,
+        );
+    }
+    p.ld_a_abs(LOWER_SAVED_A); // restore caller A (LD: flags safe)
 }
 
 // ---------------------------------------------------------------------------
@@ -2418,11 +2634,19 @@ fn a_live_after(ops: &[ir::Op], i: usize) -> bool {
 
 /// SMS address of an indexed base `b` (the un-indexed table address) for a
 /// copy source: low PRG ($8000-$BFFF) is mapped directly; RAM mirrors to
-/// $C000+. High PRG / other → None (would need a bank swap).
-fn src_base_sms(b: u16, region: ir::MemRegion) -> Option<u16> {
+/// $C000+. High PRG / other → None (would need a bank swap). MMC3 never
+/// maps the window directly (independent live banks), so window sources
+/// fall back to element-wise helper reads.
+fn src_base_sms(b: u16, region: ir::MemRegion, mmc3_windowed: bool) -> Option<u16> {
     use ir::MemRegion::*;
     match region {
-        PrgRom if b < 0xC000 => Some(b),
+        PrgRom if b < 0xC000 => {
+            if mmc3_windowed {
+                None
+            } else {
+                Some(b)
+            }
+        }
         Ram | RamMirror | Stack => Some(nes_ram_addr_to_sms(b)),
         ZeroPage => Some(sms_layout::NES_ZP_BASE + (b & 0xFF)),
         _ => None,
@@ -2466,6 +2690,7 @@ fn match_copy_loop(
     i: usize,
     routine: &ir::Routine,
     reads: Option<&std::collections::HashMap<String, u8>>,
+    mmc3_windowed: bool,
 ) -> Option<CopyLoopPlan> {
     use ir::{Cond, Op};
     let (init, want_x) = match &ops[i] {
@@ -2484,7 +2709,7 @@ fn match_copy_loop(
     // LDA src,idx ; STA dst,idx
     let (src_b, src_r) = indexed_mem(ops.get(a)?, want_x, true)?;
     let (dst_b, dst_r) = indexed_mem(ops.get(b)?, want_x, false)?;
-    let src_sms_base = src_base_sms(src_b, src_r)?;
+    let src_sms_base = src_base_sms(src_b, src_r, mmc3_windowed)?;
     let dst_sms_base = dst_base_sms(dst_b, dst_r)?;
     // Step op (INC/DEC matching idx) then optional CMP then branch.
     let ascending = matches!((ops.get(c)?, want_x), (Op::Inx, true) | (Op::Iny, false));
@@ -3129,6 +3354,27 @@ fn emit_shift_mem(
         _ => unreachable!("emit_shift_mem on non-shift op"),
     };
     emit_hl_for_rw_mem(program, addr, region);
+    if region == ir::MemRegion::PrgRam {
+        // NES SRAM over EXRAM: route through the read/helper/write
+        // sequence (exact shadows, exact fused native flags).
+        let helper = match op {
+            Op::AslMem { .. } => runtime_symbols::ASL_A,
+            Op::LsrMem { .. } => runtime_symbols::LSR_A,
+            Op::RolMem { .. } => runtime_symbols::ROL_A,
+            Op::RorMem { .. } => runtime_symbols::ROR_A,
+            _ => unreachable!("emit_shift_mem on non-shift op"),
+        };
+        emit_sram_shift(
+            program,
+            routine,
+            ops_slice,
+            op_idx,
+            helper,
+            fused,
+            opts.emit_source_comments,
+        );
+        return;
+    }
     if consumes_carry {
         program.ld_b_a();
         program.ld_a_abs(sms_layout::SHADOW_P);
@@ -3220,9 +3466,14 @@ pub fn lower_routine(
     // only layout whose low PRG window is immutable and can use the accepted
     // inline fixed-high read sequence; mapper 2 restores an exact live bank.
     let guarded_mapper_window = opts.profile.is_none_or(|profile| profile.rom.mapper != 0);
+    // MMC3 (mapper 4) has two independent 8 KiB switchable windows ($8000-
+    // $9FFF, $A000-$BFFF): no direct slot-2 image exists, so every window
+    // read resolves against the live shadows through a helper, and SRAM
+    // goes over EXRAM instead of the RAM mirror.
+    let mmc3_windowed = opts.profile.is_some_and(|profile| profile.rom.mapper == 4);
     let emit_mem_to_b =
         |program: &mut z80_emit::Program, addr: &ir::AddrExpr, region: ir::MemRegion| {
-            emit_mem_to_b_with_mode(program, addr, region, guarded_mapper_window)
+            emit_mem_to_b_with_mode(program, addr, region, guarded_mapper_window, mmc3_windowed)
         };
 
     // Pre-compute flag liveness: for each op whose result sets N/Z,
@@ -3317,7 +3568,13 @@ pub fn lower_routine(
     // Copy loops first — they span the most ops (init + label + body +
     // back-branch) and subsume the inner LDA/STA/INC fusions.
     for i in 0..ops_slice.len() {
-        if let Some(plan) = match_copy_loop(ops_slice, i, routine, opts.routine_flag_reads) {
+        if let Some(plan) = match_copy_loop(
+            ops_slice,
+            i,
+            routine,
+            opts.routine_flag_reads,
+            mmc3_windowed,
+        ) {
             for slot in fuse_consumed.iter_mut().take(plan.end).skip(i + 1) {
                 *slot = true;
             }
@@ -3666,7 +3923,18 @@ pub fn lower_routine(
                         program.ld_a_abs(nes_ram_addr_to_sms(*a));
                     }
                     (AddrExpr::Const(a), MemRegion::PrgRom) if *a < 0xC000 => {
-                        program.ld_a_abs(*a);
+                        if mmc3_windowed {
+                            // MMC3: no direct window — resolve live shadows.
+                            program.ld_hl_imm(*a);
+                            program.call(MMC3_READ_WINDOW);
+                        } else {
+                            program.ld_a_abs(*a);
+                        }
+                    }
+                    (AddrExpr::Const(a), MemRegion::PrgRam) => {
+                        // NES SRAM over SMS EXRAM.
+                        program.ld_hl_imm(*a);
+                        program.call(SRAM_READ);
                     }
                     (AddrExpr::Const(a), MemRegion::PrgRom) => {
                         emit_prg_high_read_direct(program, *a, guarded_mapper_window);
@@ -3675,7 +3943,7 @@ pub fn lower_routine(
                         emit_controller_read_indexed_x_inline(program);
                     }
                     (AddrExpr::AbsIndexedX(base), _) => {
-                        if let Some(sms) = indexed_direct_base(*base, *region) {
+                        if let Some(sms) = indexed_direct_base(*base, *region, mmc3_windowed) {
                             emit_indexed_read_direct(program, sms, IdxReg::X);
                         } else if *region == ir::MemRegion::PrgRom && *base >= 0xC000 {
                             emit_prg_high_indexed_direct(
@@ -3688,11 +3956,11 @@ pub fn lower_routine(
                             program.ld_hl_imm(indexed_base_to_sms(*base, *region));
                             program.ld_a_d();
                             program.ld_b_a();
-                            program.call(indexed_read_runtime(*base, *region));
+                            program.call(indexed_read_runtime(*base, *region, mmc3_windowed));
                         }
                     }
                     (AddrExpr::AbsIndexedY(base), _) => {
-                        if let Some(sms) = indexed_direct_base(*base, *region) {
+                        if let Some(sms) = indexed_direct_base(*base, *region, mmc3_windowed) {
                             emit_indexed_read_direct(program, sms, IdxReg::Y);
                         } else if *region == ir::MemRegion::PrgRom && *base >= 0xC000 {
                             emit_prg_high_indexed_direct(
@@ -3705,7 +3973,7 @@ pub fn lower_routine(
                             program.ld_hl_imm(indexed_base_to_sms(*base, *region));
                             program.ld_a_e_reg();
                             program.ld_b_a();
-                            program.call(indexed_read_runtime(*base, *region));
+                            program.call(indexed_read_runtime(*base, *region, mmc3_windowed));
                         }
                     }
                     (AddrExpr::ZpIndexedX(zp), _) => {
@@ -3771,7 +4039,14 @@ pub fn lower_routine(
             }
 
             Op::LdxMem { addr, region } => {
-                emit_ldxy_mem(program, addr, *region, IdxReg::X, guarded_mapper_window);
+                emit_ldxy_mem(
+                    program,
+                    addr,
+                    *region,
+                    IdxReg::X,
+                    guarded_mapper_window,
+                    mmc3_windowed,
+                );
             }
 
             Op::LdyImm(v) => {
@@ -3787,7 +4062,14 @@ pub fn lower_routine(
             }
 
             Op::LdyMem { addr, region } => {
-                emit_ldxy_mem(program, addr, *region, IdxReg::Y, guarded_mapper_window);
+                emit_ldxy_mem(
+                    program,
+                    addr,
+                    *region,
+                    IdxReg::Y,
+                    guarded_mapper_window,
+                    mmc3_windowed,
+                );
             }
 
             // ------------------------------------------------------------------
@@ -3834,8 +4116,13 @@ pub fn lower_routine(
                         ) => {
                             program.ld_abs_a(nes_ram_addr_to_sms(*a));
                         }
+                        (AddrExpr::Const(a), MemRegion::PrgRam) => {
+                            // NES SRAM store over SMS EXRAM (A = value live).
+                            program.ld_hl_imm(*a);
+                            program.call(SRAM_WRITE);
+                        }
                         (AddrExpr::AbsIndexedX(base), _) => {
-                            if let Some(sms) = indexed_direct_base(*base, *region) {
+                            if let Some(sms) = indexed_direct_base(*base, *region, mmc3_windowed) {
                                 emit_indexed_write_direct(program, sms, IdxReg::X);
                             } else {
                                 program.ld_c_a(); // save value in C
@@ -3843,11 +4130,11 @@ pub fn lower_routine(
                                 program.ld_a_d();
                                 program.ld_b_a();
                                 program.ld_a_c();
-                                program.call(WRITE_INDEXED);
+                                program.call(indexed_write_runtime(*base, *region, mmc3_windowed));
                             }
                         }
                         (AddrExpr::AbsIndexedY(base), _) => {
-                            if let Some(sms) = indexed_direct_base(*base, *region) {
+                            if let Some(sms) = indexed_direct_base(*base, *region, mmc3_windowed) {
                                 emit_indexed_write_direct(program, sms, IdxReg::Y);
                             } else {
                                 program.ld_c_a();
@@ -3855,7 +4142,7 @@ pub fn lower_routine(
                                 program.ld_a_e_reg();
                                 program.ld_b_a();
                                 program.ld_a_c();
-                                program.call(WRITE_INDEXED);
+                                program.call(indexed_write_runtime(*base, *region, mmc3_windowed));
                             }
                         }
                         (AddrExpr::ZpIndexedX(zp), _) => {
@@ -3883,35 +4170,28 @@ pub fn lower_routine(
             }
 
             Op::StxMem { addr, region } => {
-                if matches!(
-                    *region,
-                    MemRegion::Mapper | MemRegion::PrgRam | MemRegion::PrgRom
-                ) {
+                if matches!(*region, MemRegion::Mapper | MemRegion::PrgRom) {
                     return Err(LowerError::UnsupportedMapperStore {
                         pc: None,
                         reason: format!(
-                            "STX to expansion space, PRG RAM, or PRG ROM is unsupported \
+                            "STX to expansion space or PRG ROM is unsupported \
                              (addr {addr:?}, region {region:?})"
                         ),
                     });
                 }
                 // STX must NOT modify A. Bracket with push/pop AF, mirror
                 // StaMem's addressing-mode coverage.
-                emit_stxy_mem(program, addr, *region, IdxReg::X);
+                emit_stxy_mem(program, addr, *region, IdxReg::X, mmc3_windowed);
             }
 
             Op::StyMem { addr, region } => {
-                if matches!(
-                    *region,
-                    MemRegion::Mapper | MemRegion::PrgRam | MemRegion::PrgRom
-                ) {
+                if matches!(*region, MemRegion::Mapper | MemRegion::PrgRom) {
                     return Err(LowerError::UnsupportedMapperStore {
                         pc: None,
-                        reason: "STY to expansion space, PRG RAM, or PRG ROM is unsupported"
-                            .to_string(),
+                        reason: "STY to expansion space or PRG ROM is unsupported".to_string(),
                     });
                 }
-                emit_stxy_mem(program, addr, *region, IdxReg::Y);
+                emit_stxy_mem(program, addr, *region, IdxReg::Y, mmc3_windowed);
             }
 
             Op::SaxMem { addr, region } => {
@@ -3931,7 +4211,7 @@ pub fn lower_routine(
                 program.push_af(); // save shadow X on Z80 stack
                 program.ld_a_b();
                 program.ld_d_a_reg(); // SHADOW_X = (A & X) value temporarily
-                emit_stxy_mem(program, addr, *region, IdxReg::X);
+                emit_stxy_mem(program, addr, *region, IdxReg::X, mmc3_windowed);
                 program.pop_af();
                 program.ld_d_a_reg(); // restore real X
                 program.pop_bc();
@@ -4548,7 +4828,19 @@ pub fn lower_routine(
             // ------------------------------------------------------------------
             Op::IncMem { addr, region } => {
                 emit_hl_for_rw_mem(program, addr, *region);
-                if let Some(end) = fuse_nz_end[op_idx] {
+                if *region == MemRegion::PrgRam {
+                    // NES SRAM over EXRAM: no direct `(hl)` access exists.
+                    emit_sram_inc_dec(
+                        program,
+                        routine,
+                        ops_slice,
+                        op_idx,
+                        true,
+                        fuse_nz_end[op_idx],
+                        opts.routine_flag_reads,
+                        opts.emit_source_comments,
+                    );
+                } else if let Some(end) = fuse_nz_end[op_idx] {
                     // `inc (hl)` sets native S/Z: fuse the trailing branches.
                     program.inc_hl_ptr();
                     emit_fused_branches(
@@ -4571,7 +4863,19 @@ pub fn lower_routine(
 
             Op::DecMem { addr, region } => {
                 emit_hl_for_rw_mem(program, addr, *region);
-                if let Some(end) = fuse_nz_end[op_idx] {
+                if *region == MemRegion::PrgRam {
+                    // NES SRAM over EXRAM: no direct `(hl)` access exists.
+                    emit_sram_inc_dec(
+                        program,
+                        routine,
+                        ops_slice,
+                        op_idx,
+                        false,
+                        fuse_nz_end[op_idx],
+                        opts.routine_flag_reads,
+                        opts.emit_source_comments,
+                    );
+                } else if let Some(end) = fuse_nz_end[op_idx] {
                     program.dec_hl_ptr();
                     emit_fused_branches(
                         program,
@@ -5242,6 +5546,12 @@ mod tests {
             CONTROLLER_READ,
             CONTROLLER_READ_INDEXED_X,
             MAPPER_WRITE,
+            MMC3_READ_WINDOW,
+            MMC3_READ_WINDOW_INDEXED,
+            SRAM_READ,
+            SRAM_WRITE,
+            SRAM_READ_INDEXED,
+            SRAM_WRITE_INDEXED,
             ROUTE_INDEXED,
             WRITE_INDEXED,
             READ_ZP_PTR_Y,
@@ -5511,6 +5821,9 @@ chr_kib = 8
 
     #[test]
     fn stx_sty_mapper_related_regions_fail_closed() {
+        // STX/STY to expansion space ($4020-$5FFF) and PRG ROM ($8000+)
+        // stay hard errors; SRAM ($6000-$7FFF) routes through the EXRAM
+        // shim (covered by mmc3_stx_to_sram_uses_write_shim).
         for (op, mnemonic) in [
             (
                 Op::StxMem {
@@ -5518,13 +5831,6 @@ chr_kib = 8
                     region: MemRegion::Mapper,
                 },
                 "STX",
-            ),
-            (
-                Op::StyMem {
-                    addr: AddrExpr::Const(0x6000),
-                    region: MemRegion::PrgRam,
-                },
-                "STY",
             ),
             (
                 Op::StxMem {
@@ -6121,6 +6427,253 @@ chr_kib = 0
         assert!(build.asm.contains("ld bc,$8123"));
         assert!(build.asm.contains("jp rt_banked_tail_dispatch"));
         assert!(!build.asm.contains("jp rt_translated_tail_gate"));
+    }
+
+    fn mmc3_test_profile() -> profile::Profile {
+        profile::load_from_str(
+            r#"
+[rom]
+name = "mmc3-test"
+mapper = 4
+prg_kib = 64
+chr_kib = 8
+"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn mmc3_profile_routes_window_and_sram_through_helpers() {
+        let prof = mmc3_test_profile();
+        let opts = LowerOptions {
+            profile: Some(&prof),
+            emit_source_comments: true,
+            routine_flag_reads: None,
+        };
+        let routine = make_routine(
+            "test_routine",
+            vec![
+                Op::LdaMem {
+                    addr: AddrExpr::Const(0x8123),
+                    region: MemRegion::PrgRom,
+                },
+                Op::LdaMem {
+                    addr: AddrExpr::AbsIndexedX(0xA100),
+                    region: MemRegion::PrgRom,
+                },
+                Op::LdaMem {
+                    addr: AddrExpr::Const(0x6000),
+                    region: MemRegion::PrgRam,
+                },
+                Op::StaMem {
+                    addr: AddrExpr::Const(0x6001),
+                    region: MemRegion::PrgRam,
+                },
+                Op::Rts,
+            ],
+        );
+        let mut prog = z80_emit::Program::new();
+        define_runtime_stubs(&mut prog);
+        prog.org(0x0000);
+        lower_routine(&mut prog, &routine, &opts).unwrap();
+        let build = prog.finish().unwrap();
+
+        // MMC3 has no direct slot-2 window: const + indexed window reads
+        // resolve against the live shadows through helpers.
+        assert!(build.asm.contains("call rt_mmc3_read_window"));
+        assert!(build.asm.contains("call rt_mmc3_read_window_indexed"));
+        assert!(!build.asm.contains("ld a,($8123)"));
+        // SRAM goes over EXRAM, never the RAM mirror or silent zero/skip.
+        assert!(build.asm.contains("call rt_sram_read"));
+        assert!(build.asm.contains("call rt_sram_write"));
+        assert!(
+            !build
+                .asm
+                .contains("WARN: unresolved LdaMem addressing mode")
+        );
+        assert!(
+            !build
+                .asm
+                .contains("WARN: unresolved StaMem addressing mode")
+        );
+    }
+
+    #[test]
+    fn mmc3_stx_to_sram_uses_write_shim() {
+        let prof = mmc3_test_profile();
+        let opts = LowerOptions {
+            profile: Some(&prof),
+            emit_source_comments: true,
+            routine_flag_reads: None,
+        };
+        let routine = make_routine(
+            "test_routine",
+            vec![
+                Op::StxMem {
+                    addr: AddrExpr::Const(0x6002),
+                    region: MemRegion::PrgRam,
+                },
+                Op::Rts,
+            ],
+        );
+        let mut prog = z80_emit::Program::new();
+        define_runtime_stubs(&mut prog);
+        prog.org(0x0000);
+        // STX to SRAM used to be a hard UnsupportedMapperStore error.
+        lower_routine(&mut prog, &routine, &opts).unwrap();
+        let build = prog.finish().unwrap();
+        assert!(build.asm.contains("call rt_sram_write"));
+    }
+
+    #[test]
+    fn mmc3_bit_window_operand_uses_shadow_helper() {
+        let prof = mmc3_test_profile();
+        let opts = LowerOptions {
+            profile: Some(&prof),
+            emit_source_comments: true,
+            routine_flag_reads: None,
+        };
+        let routine = make_routine(
+            "test_routine",
+            vec![
+                Op::BitMem {
+                    addr: AddrExpr::Const(0x9ABC),
+                    region: MemRegion::PrgRom,
+                },
+                Op::Rts,
+            ],
+        );
+        let mut prog = z80_emit::Program::new();
+        define_runtime_stubs(&mut prog);
+        prog.org(0x0000);
+        lower_routine(&mut prog, &routine, &opts).unwrap();
+        let build = prog.finish().unwrap();
+        // Operand lands in B via the helper (A preserved for the ALU LHS).
+        assert!(build.asm.contains("call rt_mmc3_read_window"));
+        assert!(build.asm.contains("ld b,a"));
+    }
+
+    #[test]
+    fn bit_ppustatus_reads_live_status_not_zero() {
+        // Mother's reset/NMI prologues `BIT $2002` in VBlank-wait loops;
+        // the operand must be the live PPUSTATUS (VBlank bit 7), never a
+        // constant zero that spins forever.
+        let routine = make_routine(
+            "test_routine",
+            vec![
+                Op::BitMem {
+                    addr: AddrExpr::Const(0x2002),
+                    region: MemRegion::PpuReg,
+                },
+                Op::Rts,
+            ],
+        );
+        let mut prog = z80_emit::Program::new();
+        define_runtime_stubs(&mut prog);
+        prog.org(0x0000);
+        lower_routine(&mut prog, &routine, &LowerOptions::default()).unwrap();
+        let build = prog.finish().unwrap();
+        assert!(!build.asm.contains("WARN: unresolved mem-to-B mode"));
+        assert!(build.asm.contains("ld a,($CB05)")); // live VBlank flag
+        assert!(build.asm.contains("ld b,a")); // operand into B
+    }
+
+    #[test]
+    fn sram_inc_dec_round_trips_through_exram() {
+        // `INC $6D07` / `DEC $6D07` must touch SRAM via helpers — never
+        // `(hl)` on a mirror address and never the $0000 WARN fallback —
+        // with caller A spilled to RAM and N/Z committed to the shadow.
+        let routine = make_routine(
+            "test_routine",
+            vec![
+                Op::IncMem {
+                    addr: AddrExpr::Const(0x6D07),
+                    region: MemRegion::PrgRam,
+                },
+                Op::DecMem {
+                    addr: AddrExpr::Const(0x6D08),
+                    region: MemRegion::PrgRam,
+                },
+                Op::Rts,
+            ],
+        );
+        let mut prog = z80_emit::Program::new();
+        define_runtime_stubs(&mut prog);
+        prog.org(0x0000);
+        lower_routine(&mut prog, &routine, &LowerOptions::default()).unwrap();
+        let build = prog.finish().unwrap();
+        assert!(!build.asm.contains("WARN: complex addr for rw-mem operation"));
+        assert!(build.asm.contains("call rt_sram_read"));
+        assert!(build.asm.contains("call rt_sram_write"));
+        assert!(build.asm.contains("ld ($CB27),a")); // caller-A spill
+        assert!(build.asm.contains("call rt_set_nz_a")); // shadow N/Z
+        assert!(!build.asm.contains("inc (hl)"));
+        assert!(!build.asm.contains("dec (hl)"));
+    }
+
+    #[test]
+    fn sram_lsr_uses_shift_helper_and_stores() {
+        // `LSR $7411` (Mother's 16-bit shift idiom): helper produces the
+        // result + exact shadow C, then the result is stored back.
+        let routine = make_routine(
+            "test_routine",
+            vec![
+                Op::LsrMem {
+                    addr: AddrExpr::Const(0x7411),
+                    region: MemRegion::PrgRam,
+                },
+                Op::Rts,
+            ],
+        );
+        let mut prog = z80_emit::Program::new();
+        define_runtime_stubs(&mut prog);
+        prog.org(0x0000);
+        lower_routine(&mut prog, &routine, &LowerOptions::default()).unwrap();
+        let build = prog.finish().unwrap();
+        assert!(!build.asm.contains("WARN: complex addr for rw-mem operation"));
+        assert!(build.asm.contains("call rt_sram_read"));
+        assert!(build.asm.contains("call rt_lsr_a"));
+        assert!(build.asm.contains("call rt_sram_write"));
+        assert!(!build.asm.contains("srl (hl)"));
+    }
+
+    #[test]
+    fn mmc3_copy_loop_from_window_falls_back_to_helpers() {
+        let prof = mmc3_test_profile();
+        let opts = LowerOptions {
+            profile: Some(&prof),
+            emit_source_comments: true,
+            routine_flag_reads: None,
+        };
+        let ops = vec![
+            Op::LdxImm(0),
+            Op::Label("L_loop".into()),
+            Op::LdaMem {
+                addr: AddrExpr::AbsIndexedX(0x8000),
+                region: MemRegion::PrgRom,
+            },
+            Op::StaMem {
+                addr: AddrExpr::AbsIndexedX(0x0200),
+                region: MemRegion::Ram,
+            },
+            Op::Inx,
+            Op::CpxImm(16),
+            Op::BranchIf {
+                cond: Cond::NoCarry,
+                target: "L_loop".into(),
+            },
+            Op::Rts,
+        ];
+        let routine = make_routine("test_routine", ops);
+        let mut prog = z80_emit::Program::new();
+        define_runtime_stubs(&mut prog);
+        prog.org(0x0000);
+        lower_routine(&mut prog, &routine, &opts).unwrap();
+        let build = prog.finish().unwrap();
+        // No direct `ldir` from the window: the live bank is unknowable
+        // statically, so each element resolves through the helper.
+        assert!(!build.asm.contains("ldir"));
+        assert!(build.asm.contains("call rt_mmc3_read_window_indexed"));
     }
 
     #[test]

@@ -70,6 +70,8 @@
 ;   $CB80-$CBFF  Raw mirrored NES attribute shadow (2 CIRAM pages × 64 bytes)
 ;   $CB13-$CB1F  13-byte scratch ("temp w")
 ;   $CB1D        Runtime trap marker for trace-sms diagnostics
+;   $CB63-$CB72  MMC3 register shadows (mapper_mmc3.s; free exactly when
+;                NES_CHR_RAM is unset — CHR-RAM staging lives there)
 ;   Z80 SP starts at $DFFC and grows down — never touches $C100-$C1FF.
 ;   Z80 push/call pre-decrements SP, so the first write lands at $DFFA-$DFFB.
 ;   The Sega mapper registers $FFFC-$FFFF are RAM-mirrored at $DFFC-$DFFF;
@@ -87,6 +89,25 @@
 .define RT_PRG_HIGH_BAD_ADDRESS $F7
 .define RT_PRESENT_SLOT2_BAD    $F8
 .define RT_BTD_SLOT2_BAD        $F9
+; MMC3 shadow addresses (mapper_mmc3.s). Unconditional defines: plain
+; numbers, zero cost to other builds; boot.s precedes every user so the
+; preprocessor has them before apu_stub.s references them.
+.define MMC3_BANK_SELECT $CB63
+.define MMC3_R0 $CB64
+.define MMC3_R1 $CB65
+.define MMC3_R2 $CB66
+.define MMC3_R3 $CB67
+.define MMC3_R4 $CB68
+.define MMC3_R5 $CB69
+.define MMC3_R6 $CB6A
+.define MMC3_R7 $CB6B
+.define MMC3_MIRROR $CB6C
+.define MMC3_IRQ_LATCH $CB6D
+.define MMC3_IRQ_COUNTER $CB6E
+.define MMC3_IRQ_CTRL $CB6F
+.define MMC3_PRG_LOW $CB70
+.define MMC3_PRG_HIGH $CB71
+.define MMC3_CHR_DIRTY $CB72
 .ifdef CV1_RUNTIME_HOOKS
 .define RT_CV1_VBUF_ACTIVE      $FA   ; dormant C800 header must stay zero
 .endif
@@ -301,6 +322,9 @@ boot_main:
   ; 6. Load nametable from data_nametable into VRAM at $3700 (224-line
   ;    mode base = (R2 & $0C)<<10 | $700, R2=$FF -> $3700).
   ;    32*28*2 = 1792 ($0700) bytes covers the visible rows 0-27.
+  ;    Static-nametable builds only (sms_project emits DATA_NAMETABLE with
+  ;    the asset; dynamic games like Mother build every cell at runtime).
+.ifdef DATA_NAMETABLE
   ld  a, $00
   ld  d, $37
   call vdp_set_vram_addr
@@ -309,13 +333,22 @@ boot_main:
   ld  hl, data_nametable
   ld  bc, $0700
   call vdp_write_block
+.endif
 
   ; Keep the lower NES PRG window mapped in slot 2 for translated data-table
   ; reads ($8000-$BFFF). The startup asset uploads above temporarily map CHR,
   ; palette, and nametable banks here; translated code expects SMB tables such
   ; as $805A/$806D/$8080 to be readable at their original addresses.
+  ; MMC3 builds have no direct window (every $8000-$BFFF read resolves
+  ; through rt_mmc3_read_window), but presentation still asserts a canonical
+  ; slot-2 image: map the power-on LOW pair (halves 0,1).
+.ifdef NES_MMC3
+  ld  a, NES_MMC3_PRG_BASE
+  ld  ($ffff), a
+.else
   ld  a, :data_prg_low
   ld  ($ffff), a
+.endif
 
 .ifdef RAW_CIRAM_BACKEND_SRAM
   ; 6b. Clear external raw-CIRAM SRAM backend ($8000-$87FF in slot-2 SRAM
@@ -404,6 +437,12 @@ boot_main:
   ld  ($ca00), a            ; bg variant pool next-free slot = 0
   ld  ($ca07), a            ; bg variant ring has not wrapped yet
   ld  ($ca39), a            ; 8x16-sprite-mode-seen latch (ppu.s) clear
+.ifdef NES_MMC3
+  ; Power-on MMC3 register file (bank_select 0, R0-R7 defaults, LOW = half
+  ; 0, HIGH = half 1, IRQ off). Translated reset code assumes the reference
+  ; power-on mapping from the first instruction.
+  call rt_mmc3_reset
+.endif
   ld  hl, $dd80             ; ring-slot NT refcounts (chrmap.s BGV_REFCNT)
   ld  bc, $00c0             ; 192 entries for slots 64-255
   xor a
@@ -608,6 +647,7 @@ irq_handler:
   ld  a, ($cb27)
   push af
 .ifndef NES_PRG_BANK_BASE
+.ifndef NES_MMC3
   ; NROM fixed-high reads temporarily map data_prg_high inline. An IRQ may land
   ; between that map and its restore, so preserve the interrupted slot-2 bank
   ; on the re-entrant native stack and present/NMI from the canonical low bank.
@@ -616,6 +656,18 @@ irq_handler:
   ld  a, ($ffff)
   push af
   ld  a, :data_prg_low
+  ld  ($ffff), a
+.endif
+.endif
+.ifdef NES_MMC3
+  ; MMC3 slot 2 always shows the LOW pair at op boundaries (rt_mmc3_write
+  ; maintains it); borrowers restore it via rt_restore_prg_window. Preserve
+  ; a mid-borrow mapping across nesting and present from canonical.
+  ld  a, ($ffff)
+  push af
+  ld  a, (MMC3_PRG_LOW)
+  srl a
+  add a, NES_MMC3_PRG_BASE
   ld  ($ffff), a
 .endif
   ld  a, $01
@@ -649,6 +701,12 @@ irq_handler:
   ld  a, ($cb01)
   ld  e, a
 .ifndef NES_PRG_BANK_BASE
+.ifndef NES_MMC3
+  pop af
+  ld  ($ffff), a
+.endif
+.endif
+.ifdef NES_MMC3
   pop af
   ld  ($ffff), a
 .endif
@@ -785,7 +843,16 @@ _present_wait_vblank:
   add a, NES_PRG_BANK_BASE
   cp  b
 .else
+.ifdef NES_MMC3
+  ; Canonical slot-2 image is the LOW pair bank (see rt_restore_prg_window).
+  ld  b, a
+  ld  a, (MMC3_PRG_LOW)
+  srl a
+  add a, NES_MMC3_PRG_BASE
+  cp  b
+.else
   cp  :data_prg_low
+.endif
 .endif
   jp  nz, _present_slot2_bad
 .ifdef SMB_RUNTIME_HOOKS
@@ -832,6 +899,12 @@ _present_no_screen_rebuild:
   ld  ($ca34), a
 .endif
 _present_no_reg1:
+.endif
+.ifdef NES_MMC3
+  ; MMC3 CHR-bank switch: the visible tile set changed under the variant
+  ; cache. Refresh assigned variants' pixels in place (slot numbers stable,
+  ; live nametable cells stay correct). Runs in NMI/VBlank, VRAM-safe.
+  call rt_mmc3_chr_sync
 .endif
 .ifdef NES_CHR_RAM
   ; Deferred variant-cache flush (BG table switched; see ppu.s).
@@ -1050,9 +1123,17 @@ _irq_call_translated_nmi:
   ; Bound translated-NMI nesting. An overlong game handler may receive one
   ; light nested handler, but deeper re-entry exhausts the native stack.
   ; CV1's full handler normally clears $1B and RTIs after its game work.
+  ; MMC3 Mother nests productively (outer task-8 $FDBB wait unblocks via a
+  ; nested dispatch that clears $E5), so its bound is roomier.
+.ifdef NES_MMC3
+  ld  a, ($ca11)
+  cp  8
+  jp  nc, _irq_skip_translated_nmi
+.else
   ld  a, ($ca11)
   cp  2
   jp  nc, _irq_skip_translated_nmi
+.endif
 .ifdef CV1_RUNTIME_HOOKS
   ; Pending output backpressures a NEW full producer, not an already-running
   ; busy game body or its valid lag NMI. Do this before CB12/CB20 phase resets.
@@ -1168,7 +1249,18 @@ _irq_native_save_done:
   ld  ($ca34), a
 .endif
   ei
+.ifdef DIAG_DELAYNMI
+  ; TEMPORARY timing-race diagnostic: skip translated NMI bodies for the
+  ; first 8 frames so main boots uncontended (no NMI task posts/waits while
+  ; main initializes). REVERT after diagnosis (unfaithful NMI cadence).
+  ld  a, ($cb04)
+  cp  8
+  jr  c, _diag_skip_nmi_body
+.endif
   call translated_nmi       ; jumps to the profile/ROM NMI vector
+.ifdef DIAG_DELAYNMI
+_diag_skip_nmi_body:
+.endif
   di
 .ifdef DIAG_WILDJUMP
   ld  a, $06
@@ -1210,6 +1302,13 @@ _irq_native_restore_bank:
   ld  a, (hl)
   ld  ($cb14), a
   ld  ($fffe), a
+.ifdef DIAG_E5CLEAR
+  ; TEMPORARY deadlock diagnostic (Mother $E5 task flag): force-clear the
+  ; flag after every translated NMI so $FDBB waits pass. UNFAITHFUL — proves
+  ; only whether $E5 is the sole blocker. Revert after diagnosis.
+  xor a
+  ld  ($c0e5), a
+.endif
 
 _irq_skip_translated_nmi:
 
@@ -1287,8 +1386,14 @@ _pace_done:
   xor a
   ld  ($cb7e), a            ; leaving handler
 .ifndef NES_PRG_BANK_BASE
+.ifndef NES_MMC3
   pop af
-  ld  ($ffff), a            ; resume an interrupted inline fixed-high read
+  ld  ($ffff), a
+.endif            ; resume an interrupted inline fixed-high read
+.endif
+.ifdef NES_MMC3
+  pop af
+  ld  ($ffff), a            ; resume an interrupted slot-2 borrow
 .endif
   pop af
   ld  ($cb27), a
@@ -1307,6 +1412,13 @@ _irq_line_scroll_split:
   ; Mid-frame line IRQ: switch from the pre/top scroll to the captured post-hit
   ; playfield scroll, then disable further line IRQs until the next frame IRQ
   ; explicitly schedules one.
+.ifdef NES_MMC3
+  ; MMC3 scanline counter service (may deliver translated_irq). The shared
+  ; epilogue below restores D/E, $CB7E, AF/BC/HL — rt_mmc3_line_irq leaves
+  ; the machine in exactly that state.
+  call rt_mmc3_line_irq
+  jp   _irq_line_exit
+.endif
 .ifdef CV1_COHERENT_BG
   call rt_cv1_hud_line
 .else
@@ -1318,6 +1430,7 @@ _irq_line_scroll_split:
 .endif
 .endif
 
+_irq_line_exit:
   ld  a, ($cb00)
   ld  d, a
   ld  a, ($cb01)
@@ -1325,6 +1438,12 @@ _irq_line_scroll_split:
   xor a
   ld  ($cb7e), a            ; leaving handler
 .ifndef NES_PRG_BANK_BASE
+.ifndef NES_MMC3
+  pop af
+  ld  ($ffff), a
+.endif
+.endif
+.ifdef NES_MMC3
   pop af
   ld  ($ffff), a
 .endif
