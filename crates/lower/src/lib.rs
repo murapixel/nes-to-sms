@@ -6602,7 +6602,11 @@ chr_kib = 8
         prog.org(0x0000);
         lower_routine(&mut prog, &routine, &LowerOptions::default()).unwrap();
         let build = prog.finish().unwrap();
-        assert!(!build.asm.contains("WARN: complex addr for rw-mem operation"));
+        assert!(
+            !build
+                .asm
+                .contains("WARN: complex addr for rw-mem operation")
+        );
         assert!(build.asm.contains("call rt_sram_read"));
         assert!(build.asm.contains("call rt_sram_write"));
         assert!(build.asm.contains("ld ($CB27),a")); // caller-A spill
@@ -6630,7 +6634,11 @@ chr_kib = 8
         prog.org(0x0000);
         lower_routine(&mut prog, &routine, &LowerOptions::default()).unwrap();
         let build = prog.finish().unwrap();
-        assert!(!build.asm.contains("WARN: complex addr for rw-mem operation"));
+        assert!(
+            !build
+                .asm
+                .contains("WARN: complex addr for rw-mem operation")
+        );
         assert!(build.asm.contains("call rt_sram_read"));
         assert!(build.asm.contains("call rt_lsr_a"));
         assert!(build.asm.contains("call rt_sram_write"));

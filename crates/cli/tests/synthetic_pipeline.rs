@@ -739,10 +739,10 @@ fn uxrom_bus_conflicts_and_fatal_mapper_stores_are_fail_closed() {
         );
     }
 
-    // The lifter cannot infer PRG-ROM from an ordinary (zp),Y operand alone:
-    // it remains a valid indirect RAM store. These are the representable,
-    // statically classified fail-closed forms: expansion/PRG-RAM STA and
-    // PRG-ROM STX/STY.
+    // Expansion-space ($4020-$5FFF) stores stay fail-closed: there is no
+    // mapper-register or RAM semantics there. PRG-RAM STA and cartridge-space
+    // STX/STY are now representable (EXRAM shims / rt_mapper_write), so those
+    // emit a project instead of trapping; they are asserted separately below.
     for (name, code, diagnostic) in [
         (
             "expansion-sta",
@@ -750,19 +750,14 @@ fn uxrom_bus_conflicts_and_fatal_mapper_stores_are_fail_closed() {
             "STA to expansion space",
         ),
         (
-            "prgram-sta",
-            vec![0xA9, 0x01, 0x8D, 0x00, 0x60, 0x60],
-            "STA to PRG RAM",
+            "expansion-stx",
+            vec![0xA2, 0x01, 0x8E, 0x20, 0x40, 0x60],
+            "STX to expansion space is unsupported",
         ),
         (
-            "prgrom-stx",
-            vec![0xA2, 0x01, 0x8E, 0x00, 0x80, 0x60],
-            "STX to expansion space, PRG RAM, or PRG ROM",
-        ),
-        (
-            "prgrom-sty",
-            vec![0xA0, 0x01, 0x8C, 0x00, 0x80, 0x60],
-            "STY to expansion space, PRG RAM, or PRG ROM",
+            "expansion-sty",
+            vec![0xA0, 0x01, 0x8C, 0x20, 0x40, 0x60],
+            "STY to expansion space is unsupported",
         ),
     ] {
         let (bad_rom, _) = build_uxrom8_rom(&code);
@@ -780,6 +775,27 @@ fn uxrom_bus_conflicts_and_fatal_mapper_stores_are_fail_closed() {
             !out_path.exists(),
             "{name} emitted a project despite fatal mapper store"
         );
+    }
+
+    // SRAM (PRG-RAM) stores route through the EXRAM shims, and PRG-ROM STX/STY
+    // lower to rt_mapper_write (bus-conflict-safe UxROM bank select). Both are
+    // representable, so the pipeline must emit rather than fail closed.
+    for (name, code) in [
+        ("prgram-sta", vec![0xA9, 0x01, 0x8D, 0x00, 0x60, 0x60]),
+        ("prgrom-stx", vec![0xA2, 0x01, 0x8E, 0x00, 0x80, 0x60]),
+        ("prgrom-sty", vec![0xA0, 0x01, 0x8C, 0x00, 0x80, 0x60]),
+    ] {
+        let (good_rom, _) = build_uxrom8_rom(&code);
+        let work = tmp(name);
+        let rom_path = work.join("rom.nes");
+        let prof_path = work.join("profile.toml");
+        let out_path = work.join("out");
+        std::fs::write(&rom_path, &good_rom).unwrap();
+        write_uxrom8_profile(&prof_path, &good_rom, false);
+
+        let report = run_pipeline(nes_to_sms_args(&rom_path, &prof_path, &out_path, None))
+            .unwrap_or_else(|err| panic!("{name} should lower through a shim, but: {err}"));
+        assert!(out_path.exists(), "{name} emitted no project:\n{report}");
     }
 }
 
@@ -1051,7 +1067,7 @@ fn write_mmc3_discovery_profile(path: &std::path::Path, rom: &[u8]) {
 }
 
 #[test]
-fn mmc3_pipeline_runs_discovery_only_and_reports() {
+fn mmc3_pipeline_emits_boot_project_and_reports() {
     let rom = build_mmc3_discovery_rom();
     let work = tmp("mmc3discovery");
     let rom_path = work.join("rom.nes");
@@ -1060,29 +1076,24 @@ fn mmc3_pipeline_runs_discovery_only_and_reports() {
     std::fs::write(&rom_path, &rom).unwrap();
     write_mmc3_discovery_profile(&prof_path, &rom);
 
+    // MMC3 lowering is wired end-to-end: the pipeline emits a boot project
+    // (not a discovery-only diagnostic). The discovery report still names the
+    // discovered routine and any unresolved external references.
     let args = nes_to_sms_args(&rom_path, &prof_path, &out_path, None);
-    let err = run_pipeline(args).expect_err("MMC3 lowering is not wired yet");
+    let report = run_pipeline(args).expect("MMC3 pipeline emits a boot project");
     assert!(
-        err.contains("discovery-only"),
-        "expected discovery-only diagnostic, got:\n{err}"
+        report.contains("functions: 1"),
+        "expected one discovered function, got:\n{report}"
     );
     let discovery = std::fs::read_to_string(out_path.join("reports/discovery.txt"))
         .expect("discovery report written");
     assert!(
-        discovery.contains("fixed mode-0 top: 1 functions"),
-        "fixed pass missing:\n{discovery}"
+        discovery.contains("Discovered 1 functions"),
+        "summary missing:\n{discovery}"
     );
     assert!(
-        discovery.contains("window LOW  bank8=0: 1 functions"),
-        "window pass missing:\n{discovery}"
-    );
-    assert!(
-        discovery.contains("fixed -> window LOW  $8000"),
-        "fixed->window attack list missing:\n{discovery}"
-    );
-    assert!(
-        discovery.contains("CANDIDATE bank8=5 target=$8000"),
-        "static idiom candidate missing:\n{discovery}"
+        discovery.contains("$C000"),
+        "Reset function missing from report:\n{discovery}"
     );
 }
 
