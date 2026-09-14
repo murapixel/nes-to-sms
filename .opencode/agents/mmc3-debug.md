@@ -57,6 +57,26 @@ Your loop for each hard trap (`$CB1D` marker + `$CB1B/$CB1C` id):
 5. Commit to your branch (`mmc3/debug-trap-triage`) with a `MMC3:`-prefixed
    message. Report: trap → root cause → fix → verification output.
 
+Efficiency — never block on a monolithic diff:
+- Scope the run to the suspect region instead of diffing everything:
+  `--frames N` set just past the frame you care about, plus
+  `FD_DEBUG_FRAME=<frame>` and/or `FD_WATCH=all` to get the first
+  mismatching ordered write. A 30k-frame `frame-diff` costs ~1h of CPU and
+  usually answers less than a scoped 200-frame run that finishes in seconds.
+- Use the narrowest diagnostic that can falsify the hypothesis: byte dumps
+  and `.sym`/`translated.asm` reads are instant; reserve full-route diffs for
+  the final "did the fix move the divergence?" check.
+- For any long job, detach it (`setsid … </dev/null >log 2>&1 &`) and poll
+  with short sleeps. Do not spend a step on a single long `sleep`; keep
+  working the next hypothesis while the job runs.
+- `stdbuf -o0` on long runs so partial output is readable as it goes.
+- If a diff has been running for more than a few minutes without answering
+  the specific question, kill it, scope it down, and rerun.
+
+The live objective for the current session is the invocation message (and,
+under the supervisor, `$STATE/debug_task_hint`). Do not treat older notes in
+this file as the current task.
+
 Budget and stop rule: a single trap engagement is budgeted at ~3 hours.
 If the trap is not resolved by then — or if evidence points at an
 escalation (e.g. reference genuinely executes SRAM-resident code, which
@@ -65,10 +85,12 @@ and report: what was tried (with trace excerpts), what was ruled out, and
 what the escalation would cost. Do not burn further iterations hoping the
 next rebuild fixes it; a stuck debug loop is itself a finding.
 
-Open edge (Session 1): bank20 `$94FD: JSR $6000` into zeroed SRAM —
-reference never executes it in 120 frames while subject reaches it ~frame
-30 via `$9400`-chain continuation past `$FE08`-return. Suspects: `$FE08`
-epilogue path, or subject-only continuation. Start there.
+(Superseded.) The original "open edge" note here described the Session-1
+bank20 `$94FD: JSR $6000` theory, which was disproven: that trap was a
+banked-dispatch miss (marker `$E2`) from the NMI task path, not `$6000`
+SRAM execution, and it is long fixed. Dynamic per-session state now lives in
+the invocation message / `$STATE/debug_task_hint`; keep this file to standing
+instructions only.
 
 Session protocol (follow every invocation):
 - Your session == your branch (`mmc3/debug-trap-triage`) in
