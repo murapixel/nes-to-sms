@@ -808,3 +808,40 @@ addr = 0xbc27
 [[bank_entry]]
 bank = 19
 addr = 0xbc96
+
+# Coverage batch 2026-09-14 (2x bank-19 HIGH; orchestrator-applied from
+# /tmp/mm3_autopilot/coverage_seeds.toml). Both byte-verified independently
+# by the orchestrator at fileoff = 16 + 19*8192 + (addr-$A000): $A064 =
+# 24 83 70 23 A5 82 F0 16 20 B3 A0 B0 03 20 B3 A0 (matches), $BBF5 =
+# A9 00 A2 BC 85 80 86 81 4C 23 F0 (matches); anchor b19 $BF62 =
+# 20 95 BF re-verified. No [[bank_call]] additions: no unambiguous
+# fixed->window JSR evidence for either (coverage finding 1: $A064 caller
+# mystery — pushed return $CCD2 with no linear JSR; possible RTS-dispatch
+# or PRG-mode-1 edge, repro cov_h.txt + FD_TRACE_PC=A064).
+
+# b19 $A064 = status-screen poll loop (BIT $83 / BVS / LDA $82 / BEQ /
+# JSR $A0B3 x2 / JMP $A064 self-loop).
+# Provenance: MMC3_ENTRY bank8=19 in cov_e + cov_h harvests
+# (FD_LOG_BANK_ENTRIES=1, FD_PAD_RAW=/tmp/toolchain/cov_e.txt==cov_h.txt
+# verified identical via diff, 20600 frames, --ref-only, +FD_PAD_BOTH=1;
+# deterministic — both runs yield identical 93-entry sets).
+# TRACE_PC (cov_h): bank=19 live at frames 12200-12998 every 42f,
+# 13200/13400/13600, 16224-16672 (X=pad bits $04/$80/$02, stack_pc=$CCD2);
+# cov_i: frames 7500/7600/8900/9100-9436. Executes ONLY while the STATUS
+# screen (B-in-room) is open.
+[[bank_entry]]
+bank = 19
+addr = 0xa064
+
+# b19 $BBF5 = goods-dispatch ptr-init trampoline (LDA #$00; LDX #$BC;
+# STA $80; STX $81; JMP $F023), sibling of seeded $BBE0 (same pattern,
+# JMP $F018); preceded by pointer-table data $BBEB-$BBF4.
+# Provenance: MMC3_ENTRY bank8=19 in cov_j harvest
+# (FD_LOG_BANK_ENTRIES=1, FD_PAD_RAW=/tmp/toolchain/cov_j.txt, 11400
+# frames, --ref-only, +FD_PAD_BOTH=1; 100-entry set, the only unseeded
+# member). Executed with the グッズ goods screen open (PPM-proven
+# ref_08850/ref_09750). Union of all 8 harvest runs (cov_e/f/g/h/i/j/k/l)
+# shows no other unseeded entries.
+[[bank_entry]]
+bank = 19
+addr = 0xbbf5
