@@ -787,6 +787,27 @@ addr = 0x8648
 # bank-dispatch misses ($963D/$9786/$97B0/$A3F8/$A92F/$AB09/$B777/
 # $B79B/$B7A4/$BC73/$BCAA/$D23E/$D628/$E09C) reachable only AFTER the
 # RAM-execution blockers are cleared.
+# Addendum 2 (re-derived at 9933524 from ROM byte decode + translated.asm):
+# the blob is INTERLEAVED code+data, not 10 clean routines. Code blocks are
+# $6000-$60AC (entries $6000/$6047/$6052/$605D + 2 internal routines) and
+# $62AD-$6346 (entries $62AD/$62D8/$62ED/$6303/$631D/$6332); data sits
+# between them ($60AD-$62AC) and after ($6347-$6BFF). The code is
+# self-contained: its absolute addressing modes use zero-page operands only
+# ($0074,$0084, $0000+Y OAM staging) plus relative branches — NO absolute
+# JSR/JMP into other WRAM code. The data at $6347 is a pointer table mixing
+# PRG ($8010/$8030/$8050/$8070) and WRAM ($6384/$63ab/$63b8/$7478/$74b8/
+# $74f8/$7538/$7689) targets, i.e. the blob also feeds INDIRECT dispatch
+# into more WRAM-resident code/data beyond the 10 direct entries, so a
+# static-code-region fix must discover through these tables, not just seed
+# 10 JSRs. The DATA half is already done: ~100 absolute $6000-$6BFF refs (grep count) in
+# PRG code lower to SMS EXRAM (lower.rs indirect_ptr_sms maps $6000-$7FFF
+# -> numerically-identical EXRAM address); only blob POPULATION (build-time
+# bake from CHR, phase 4) is missing. The remaining engine work is CODE
+# lifting over a CHR-backed $6000-$6BFF view, not data mapping. $00D7
+# trampoline byte-confirmed: bank31 $F98E = A5 D7 F0 03 20 D7 00 A9 00 85
+# EA (LDA $D7; BEQ; JSR $00D7; LDA #0; STA $EA) — the game writes a JMP to
+# ZP $00D7-$00D9 at runtime; a separate dynamic-execution surface that
+# needs runtime indirect-call-through-ZP, not a static overlay.
 
 # b19 $B5A5 = A5 28 / 4C 50 C8 (LDA $28; JMP $C850): code.
 [[bank_entry]]
