@@ -37,6 +37,55 @@ name = "XferCA89"
 addr = 0xC9C7
 name = "XferC9C7"
 
+# $CA19 is an inline RTS jump-table dispatcher (not a profiled
+# [[jump_engine]]: its table is not laid out at JSR caller+3):
+#   $CA19: STA $72; ASL A; TAY
+#   $CA1D: LDA $CA27,Y; PHA   ; high byte first
+#   $CA21: LDA $CA26,Y; PHA   ; low byte last
+#   $CA25: RTS                ; pops word, +1 -> effective target
+# The table ($CA26 low / $CA27 high, 10 entries) yields, per word+1:
+#   A=0..3 -> $CA50   A=4 -> $CA89   A=5 -> $CA3A   A=6 -> $CAAF
+#   A=7 -> $CAD0      A=8 -> $CA77   A=9 -> $CB52
+# Every arm is fixed $C000-$FFFF code (dispatch record NES bank $FF) and
+# every arm was byte-disassembled as a clean instruction boundary:
+# $CA50 = 68 (PLA), the rest start A4 7A (LDY $7A). Only $CA89 had a
+# static record; the other arms are reached solely through
+# rt_rts_dispatch, so _btd_miss realigned the frame-32 A=1 dispatch to
+# the next lifted fixed boundary $CA89 and silently ran the A=4 arm
+# (subject diverged at NES $CA8B, STA $76). Reference harvest evidence
+# (40 frames, mother_input12.txt, FD_TRACE_PC): $CA50 at frame 32 (the
+# first divergence) and again frames 33-35; $CAAF at frame 33. The
+# remaining arms were not observed in this window but are rooted anyway
+# so a later A=5/7/8/9 dispatch cannot silently realign onto a sibling
+# arm instead of trapping (rooting only the observed two would make
+# $CA3A/$CA77 realign to the freshly-rooted $CA50, a silent wrong-code
+# jump). No bank numbers invented: all six are fixed-bank arms of the
+# same byte-verified table.
+
+[[function]]
+addr = 0xCA3A
+name = "XferCA3A"
+
+[[function]]
+addr = 0xCA50
+name = "XferCA50"
+
+[[function]]
+addr = 0xCA77
+name = "XferCA77"
+
+[[function]]
+addr = 0xCAAF
+name = "XferCAAF"
+
+[[function]]
+addr = 0xCAD0
+name = "XferCAD0"
+
+[[function]]
+addr = 0xCB52
+name = "XferCB52"
+
 # Indirect-transfer hot entry (every frame via JMP ($007C)): $FA38 is
 # task-8's streaming-loop interior (INY; LDX $0400,Y; ...). No static refs
 # (data-driven pointer); without a record every dispatch misses. Rooted so
