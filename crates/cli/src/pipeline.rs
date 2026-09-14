@@ -575,6 +575,212 @@ fn emit_translated_vector_aliases(program: &mut z80_emit::Program, reset: u16, n
     program.translated_tail_jmp(&format_label(irq));
 }
 
+/// Rewrite a lifted WRAM routine's synthetic addresses ($8000+ blob view)
+/// back into WRAM space ($6000-$7FFF) under a `L_w_XXXX` label prefix. The
+/// entry name is already `L_w_XXXX` (set at lift time) and is left alone;
+/// every synthetic `L_XXXX` branch/ref is remapped, and `Source` PCs follow.
+fn remap_wram_routine(r: &mut ir::Routine, dest: u16, len: u16) {
+    let synth_hi = 0x8000u16.saturating_add(len - 1);
+    let to_wram = |synth: u16| dest + (synth - 0x8000);
+    let fix_label = |l: &mut String| {
+        if let Some(hex) = l.strip_prefix("L_")
+            && hex.len() == 4
+            && let Ok(a) = u16::from_str_radix(hex, 16)
+            && a >= 0x8000
+            && a <= synth_hi
+        {
+            *l = format!("L_w_{:04X}", to_wram(a));
+        }
+    };
+    for op in r.ops.iter_mut() {
+        match op {
+            ir::Op::Label(l) => fix_label(l),
+            ir::Op::Source { pc, .. } => *pc = to_wram(*pc),
+            ir::Op::BranchIf { target, .. }
+            | ir::Op::Jmp { target }
+            | ir::Op::Jsr { target }
+            | ir::Op::MaterializedJsr { target, .. }
+            | ir::Op::ReturnEscape { target, .. } => fix_label(target),
+            ir::Op::JumpEngineCall {
+                targets,
+                return_target,
+                ..
+            } => {
+                for t in targets.iter_mut() {
+                    fix_label(t);
+                }
+                if let Some(rt) = return_target {
+                    fix_label(rt);
+                }
+            }
+            _ => {}
+        }
+    }
+    for l in r
+        .branch_labels
+        .iter_mut()
+        .chain(r.external_calls.iter_mut())
+    {
+        fix_label(l);
+    }
+    r.entry = to_wram(r.entry);
+    r.end = to_wram(r.end);
+}
+
+/// Lift static WRAM code blobs (mapper 4 `[[wram_blob]]`). The engine has no
+/// analysis window over $6000-$7FFF (it is PRG-RAM), so each blob is placed
+/// at $8000+ in a synthetic view (where `cpu_to_prg` already reads bytes),
+/// walked from its declared entries, then remapped back to WRAM space. The
+/// routine's `L_XXXX` auto-label is still emitted, so an unannotated
+/// `JSR $6047` from PRG code resolves to the translated body directly.
+fn lift_wram_blobs(
+    chr: &[u8],
+    prof: &profile::Profile,
+) -> Result<(Vec<ir::Routine>, Vec<String>), Error> {
+    let mut routines = Vec::new();
+    let mut failures = Vec::new();
+
+    for blob in &prof.wram_blobs {
+        let len = usize::from(blob.length);
+        let Ok(src) = usize::try_from(blob.source) else {
+            return Err(Error::Diagnostic(format!(
+                "wram_blob source {:#X} overflows usize",
+                blob.source
+            )));
+        };
+        let Some(end) = src.checked_add(len) else {
+            return Err(Error::Diagnostic(format!(
+                "wram_blob source {:#X}+{:#X} overflows",
+                blob.source, len
+            )));
+        };
+        if end > chr.len() {
+            return Err(Error::Diagnostic(format!(
+                "wram_blob source {:#X}+{:#X} exceeds CHR ROM ({} bytes)",
+                blob.source,
+                len,
+                chr.len()
+            )));
+        }
+        // Synthetic view: blob byte i appears at CPU address $8000+i.
+        let mut view = vec![0u8; 0x2000];
+        view[..len].copy_from_slice(&chr[src..end]);
+        let window = analysis::AnalysisWindow {
+            start: 0x8000,
+            end_inclusive: 0x8000u16 + len as u16 - 1,
+        };
+        let synth = |wram: u16| 0x8000 + (wram - blob.dest);
+
+        let mut wprof = prof.clone();
+        wprof.functions = blob
+            .entries
+            .iter()
+            .map(|&e| profile::Function {
+                addr: synth(e),
+                name: format!("L_w_{e:04X}"),
+                note: Some("wram_blob entry".to_string()),
+            })
+            .collect();
+        wprof.jump_tables.clear();
+        wprof.jump_engines.clear();
+        wprof.data_regions.clear();
+        wprof.return_escapes.clear();
+        wprof.return_consumes.clear();
+
+        let analyzed = analyze_with_continuation_roots(
+            &view,
+            nes_rom_like::Vectors {
+                nmi: 0,
+                reset: 0,
+                irq: 0,
+            },
+            &mut wprof,
+            window,
+            None,
+        );
+        let mut funcs: Vec<analysis::DiscoveredFunction> = analyzed.functions.functions.clone();
+        for f in &funcs {
+            if !window.contains(f.addr) || f.end > window.end_inclusive + 1 {
+                return Err(Error::Diagnostic(format!(
+                    "wram_blob @${:04X}: walk escaped the blob window: ${:04X}-${:04X}",
+                    blob.dest, f.addr, f.end
+                )));
+            }
+        }
+        funcs.sort_by_key(|f| f.addr);
+        funcs.dedup_by_key(|f| f.addr);
+        for i in 0..funcs.len().saturating_sub(1) {
+            if funcs[i].end > funcs[i + 1].addr {
+                funcs[i].end = funcs[i + 1].addr;
+            }
+        }
+        funcs.retain(|f| f.end > f.addr);
+
+        // Pass 1: collect referenced synthetic PCs for cross-routine labels.
+        let mut referenced: std::collections::HashSet<u16> = Default::default();
+        for f in &funcs {
+            let opts = ir::LiftOptions {
+                start: f.addr,
+                end: f.end,
+                entry_name: String::new(),
+                jump_engine_sites: Vec::new(),
+                return_escape_sites: Vec::new(),
+                return_consume_sites: Vec::new(),
+                materialized_call_sites: Vec::new(),
+                window_label_prefix: None,
+                extra_label_pcs: Vec::new(),
+            };
+            if let Ok(r) = ir::lift_range(&view, &opts) {
+                for lbl in r.branch_labels.iter().chain(r.external_calls.iter()) {
+                    if let Some(hex) = lbl.strip_prefix("L_")
+                        && hex.len() == 4
+                        && let Ok(a) = u16::from_str_radix(hex, 16)
+                    {
+                        referenced.insert(a);
+                    }
+                }
+            }
+        }
+
+        // Pass 2: lift each routine and remap to WRAM space.
+        for f in &funcs {
+            let extras: Vec<u16> = referenced
+                .iter()
+                .filter(|&&pc| pc > f.addr && pc < f.end)
+                .copied()
+                .collect();
+            let wram_entry = blob.dest + (f.addr - 0x8000);
+            let opts = ir::LiftOptions {
+                start: f.addr,
+                end: f.end,
+                entry_name: format!("L_w_{wram_entry:04X}"),
+                jump_engine_sites: Vec::new(),
+                return_escape_sites: Vec::new(),
+                return_consume_sites: Vec::new(),
+                materialized_call_sites: Vec::new(),
+                window_label_prefix: None,
+                extra_label_pcs: extras,
+            };
+            match ir::lift_range(&view, &opts) {
+                Ok(mut r) => {
+                    ir::mark_rts_dispatch(&mut r.ops);
+                    if !r.ops.last().is_some_and(ir::Op::is_hard_terminator) {
+                        let tgt = format!("L_w_{:04X}", blob.dest + (r.end - 0x8000));
+                        if !r.external_calls.contains(&tgt) {
+                            r.external_calls.push(tgt.clone());
+                        }
+                        r.ops.push(ir::Op::Jmp { target: tgt });
+                    }
+                    remap_wram_routine(&mut r, blob.dest, blob.length);
+                    routines.push(r);
+                }
+                Err(e) => failures.push(format!("wram_blob @${:04X}: {:?}", f.addr, e)),
+            }
+        }
+    }
+    Ok((routines, failures))
+}
+
 pub fn run(args: &Args) -> Result<String, Error> {
     // 1. Read and parse the ROM.
     let rom_bytes = std::fs::read(&args.rom)?;
@@ -1575,6 +1781,17 @@ pub fn run(args: &Args) -> Result<String, Error> {
 
     routines.extend(banked_routines);
 
+    // 4d. Static WRAM code blobs (mapper 4): lift declared entries from
+    // CHR-backed bytes so JSRs into $6000-$7FFF dispatch to translated
+    // routines instead of unresolved strict-trap stubs. Their `L_XXXX`
+    // auto-labels are emitted alongside the `L_w_XXXX` names, so existing
+    // unannotated JSR targets resolve directly.
+    if mmc3 && !prof.wram_blobs.is_empty() {
+        let (wram_routines, wram_failures) = lift_wram_blobs(image.chr, &prof)?;
+        lift_failures.extend(wram_failures);
+        routines.extend(wram_routines);
+    }
+
     for routine in &routines {
         let bank = profile_target_identity(&routine.name).and_then(|(bank, _)| bank);
         for target in routine
@@ -2051,6 +2268,11 @@ pub fn run(args: &Args) -> Result<String, Error> {
         program.label("rt_dispatch_table");
         let mut dispatch_records = routines
             .iter()
+            // WRAM code routines (entry < $8000) are never runtime-dispatched:
+            // they are reached only by direct JSRs, and the dispatch page
+            // directory only covers $8000-$FFFF, so an entry below $8000
+            // would stall the page walk (and is unreachable anyway).
+            .filter(|r| r.entry >= 0x8000)
             .map(|r| match r.name.strip_prefix("L_b") {
                 Some(rest) => {
                     let mut it = rest.splitn(2, '_');
