@@ -186,6 +186,116 @@ fn load_button_script(path: &str) -> Result<Vec<(usize, u8)>, String> {
     Ok(events)
 }
 
+/// Parse a NES-button event spec ("buttons" half of a `FRAME:buttons`
+/// entry) into raw NES controller bits. Unlike `buttons_to_sms_port_dc`,
+/// this does **not** squeeze the buttons through the mode-dependent SMS
+/// $DC face mapping, so A, B, Select and Start stay independent.
+fn nes_buttons_from_spec(spec: &str) -> Result<u8, String> {
+    let mut nes = 0u8;
+    for raw in spec.split(',') {
+        let button = raw.trim().to_ascii_lowercase();
+        if button.is_empty() {
+            continue;
+        }
+        let bit = match button.as_str() {
+            "up" => Buttons::UP,
+            "down" => Buttons::DOWN,
+            "left" => Buttons::LEFT,
+            "right" => Buttons::RIGHT,
+            "a" => Buttons::A,
+            "b" => Buttons::B,
+            "select" => Buttons::SELECT,
+            "start" => Buttons::START,
+            other => return Err(format!("unknown NES button entry: {other}")),
+        };
+        nes |= bit;
+    }
+    Ok(nes)
+}
+
+fn parse_nes_button_event(spec: &str) -> Result<(usize, u8), String> {
+    let (frame, buttons) = spec
+        .split_once(':')
+        .or_else(|| spec.split_once('='))
+        .ok_or_else(|| format!("expected FRAME:buttons, got {spec}"))?;
+    let frame = frame
+        .trim()
+        .parse::<usize>()
+        .map_err(|_| format!("invalid frame in NES button event: {frame}"))?;
+    Ok((frame, nes_buttons_from_spec(buttons)?))
+}
+
+fn load_nes_button_script(path: &str) -> Result<Vec<(usize, u8)>, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|err| format!("failed to read NES button script {path}: {err}"))?;
+    let mut events = Vec::new();
+    for (line_idx, raw) in text.lines().enumerate() {
+        let line = raw.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        events.push(
+            parse_nes_button_event(line).map_err(|err| {
+                format!("invalid NES button script {path}:{}: {err}", line_idx + 1)
+            })?,
+        );
+    }
+    events.sort_by_key(|(frame, _)| *frame);
+    Ok(events)
+}
+
+/// FD_PAD_RAW: decoupled reference stimulus. The value is either the path
+/// to a NES-button script (same `FRAME:buttons` line format as
+/// --buttons-script, but button names are raw NES
+/// A/B/Select/Start/DPad) or an inline `;`-separated event list, e.g.
+/// `FD_PAD_RAW=40:start;60:;100:a;120:right,down`.
+///
+/// This exists because every previous knob squeezed the face buttons
+/// through the mode-dependent SMS $DC mapping (title: Button1->Select,
+/// Button2->Start; gameplay: Button1->A, Button2->B) or aliased them
+/// (`FD_PAD_BOTH` -> A+Select / B+Start). Games that never set SMB's
+/// $0770 title flag (e.g. Mother) can therefore never receive a clean A
+/// *and* Start in one run. FD_PAD_RAW bypasses that mapping entirely on
+/// the reference side; the subject still sees the closest SMS $DC
+/// equivalent derived via `nes_buttons_to_sms_dc`.
+fn parse_raw_nes_input(spec: &str) -> Result<Vec<(usize, u8)>, String> {
+    if std::path::Path::new(spec).is_file() {
+        return load_nes_button_script(spec);
+    }
+    let mut events = Vec::new();
+    for part in spec.split(';') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        events.push(parse_nes_button_event(part)?);
+    }
+    if events.is_empty() {
+        return Err(format!("FD_PAD_RAW has no events: {spec}"));
+    }
+    events.sort_by_key(|(frame, _)| *frame);
+    Ok(events)
+}
+
+/// Raw NES-button timeline: each event replaces the held button set from
+/// its frame until the next event. Reference-side only.
+struct RawNesTimeline {
+    events: Vec<(usize, u8)>, // frame -> raw NES controller bits
+}
+
+impl RawNesTimeline {
+    fn from_events(events: Vec<(usize, u8)>) -> Self {
+        Self { events }
+    }
+
+    fn at(&self, frame: usize) -> u8 {
+        let idx = self
+            .events
+            .partition_point(|(event_frame, _)| *event_frame <= frame);
+        if idx == 0 { 0 } else { self.events[idx - 1].1 }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Reference: NES system bus over oracle_6502
 // ---------------------------------------------------------------------------
@@ -843,7 +953,7 @@ mod mapper_tests {
     fn mmc3_reference_runs_bank_switch_nmi_and_irq() {
         let (prg, chr) = mmc3_smoke_rom();
         let timeline = ButtonTimeline::builtin("none".to_string());
-        let (_init, snaps) = run_reference(prg, chr, mmc3_policy(), 2, &timeline);
+        let (_init, snaps) = run_reference(prg, chr, mmc3_policy(), 2, &timeline, None);
         assert_eq!(snaps.len(), 2);
         let ram = snaps.last().unwrap();
         assert_eq!(ram[0x10], 0x42, "R6-switched JSR $8000 ran");
@@ -1025,6 +1135,7 @@ fn run_reference(
     mapper_policy: nes_rom::MapperPolicy,
     frames: usize,
     timeline: &ButtonTimeline,
+    raw: Option<&RawNesTimeline>,
 ) -> ([u8; 0x800], Vec<[u8; 0x800]>) {
     use oracle_6502::Cpu;
     let mut cpu = Cpu::new();
@@ -1212,6 +1323,7 @@ fn run_reference(
             frame,
             timeline,
             if pause_is_start { 0 } else { bus.ram[0x0770] },
+            raw,
         );
         bus.vblank = true;
         bus.sprite0_phase = 0; // new frame: re-arm the sprite-0 hit handshake
@@ -1663,7 +1775,15 @@ fn sms_dc_to_nes(dc: u8, title_mode: bool) -> u8 {
 /// intent round-tripped through the SMS controller mapping, using the
 /// reference's current OperMode so the title/gameplay split matches the
 /// runtime.
-fn effective_nes_buttons(frame: usize, timeline: &ButtonTimeline, oper_mode: u8) -> u8 {
+fn effective_nes_buttons(
+    frame: usize,
+    timeline: &ButtonTimeline,
+    oper_mode: u8,
+    raw: Option<&RawNesTimeline>,
+) -> u8 {
+    if let Some(raw) = raw {
+        return raw.at(frame);
+    }
     sms_dc_to_nes(timeline.sms_dc_at(frame), oper_mode == 0)
 }
 
@@ -2368,12 +2488,36 @@ fn main() {
     }
     let prg = image.prg.to_vec();
 
+    // FD_PAD_RAW decouples the reference's face buttons from the
+    // mode-dependent SMS $DC mapping (see parse_raw_nes_input). Opt-in:
+    // when unset every existing route is byte-identical.
+    let raw_events = std::env::var("FD_PAD_RAW").ok().map(|spec| {
+        parse_raw_nes_input(&spec).unwrap_or_else(|err| panic!("invalid FD_PAD_RAW: {err}"))
+    });
+    let raw_timeline = raw_events
+        .as_ref()
+        .map(|events| RawNesTimeline::from_events(events.clone()));
+
     let (timeline, script_desc) = if let Some(path) = buttons_script {
         let events = load_button_script(&path)
             .unwrap_or_else(|err| panic!("invalid --buttons-script: {err}"));
         (
             ButtonTimeline::from_events(events),
             format!("buttons-script:{path}"),
+        )
+    } else if let Some(events) = &raw_events {
+        // Subject-side input for FD_PAD_RAW runs: the raw NES buttons
+        // mapped through the SMS $DC encoding. The reference uses the
+        // exact raw NES set (raw_timeline); this derived timeline only
+        // feeds the subject, whose runtime face mapping is fixed.
+        (
+            ButtonTimeline::from_events(
+                events
+                    .iter()
+                    .map(|(frame, buttons)| (*frame, nes_buttons_to_sms_dc(Buttons(*buttons))))
+                    .collect(),
+            ),
+            format!("FD_PAD_RAW({} events)", events.len()),
         )
     } else {
         (ButtonTimeline::builtin(script.clone()), script.clone())
@@ -2383,8 +2527,14 @@ fn main() {
         "Reference: running SMB PRG ({} bytes) for {frames} frames, script={script_desc}",
         prg.len()
     );
-    let (ref_init, ref_snaps) =
-        run_reference(prg, image.chr.to_vec(), mapper_policy, frames, &timeline);
+    let (ref_init, ref_snaps) = run_reference(
+        prg,
+        image.chr.to_vec(),
+        mapper_policy,
+        frames,
+        &timeline,
+        raw_timeline.as_ref(),
+    );
 
     // FD_REF_ONLY=1: print a compact per-frame reference trajectory for
     // authoring/recalibrating input scripts against real-NES dynamics
@@ -2777,7 +2927,62 @@ mod tests {
     fn effective_buttons_use_mode_dependent_sms_face_mapping() {
         let timeline =
             ButtonTimeline::from_events(vec![(0, buttons_to_sms_port_dc("start").unwrap())]);
-        assert_eq!(effective_nes_buttons(0, &timeline, 0), Buttons::START);
-        assert_eq!(effective_nes_buttons(0, &timeline, 1), Buttons::B);
+        assert_eq!(effective_nes_buttons(0, &timeline, 0, None), Buttons::START);
+        assert_eq!(effective_nes_buttons(0, &timeline, 1, None), Buttons::B);
+    }
+
+    #[test]
+    fn parses_raw_nes_button_event_independently() {
+        let (frame, buttons) = parse_nes_button_event("40:start,a,down").unwrap();
+        assert_eq!(frame, 40);
+        assert_eq!(buttons, Buttons::START | Buttons::A | Buttons::DOWN);
+        // An empty button list releases everything.
+        assert_eq!(parse_nes_button_event("60:").unwrap().1, 0);
+    }
+
+    /// FD_PAD_RAW must deliver a clean NES A and a clean NES Start in the
+    /// same run regardless of OperMode — the decoupling the SMS $DC
+    /// round-trip (and FD_PAD_BOTH's aliasing) cannot express.
+    #[test]
+    fn raw_nes_timeline_bypasses_mode_dependent_sms_face_mapping() {
+        let timeline = ButtonTimeline::from_events(Vec::new());
+        let raw = RawNesTimeline::from_events(vec![
+            (10, Buttons::START),
+            (20, 0),
+            (30, Buttons::A),
+            (40, Buttons::RIGHT),
+        ]);
+        assert_eq!(effective_nes_buttons(9, &timeline, 0, Some(&raw)), 0);
+        assert_eq!(
+            effective_nes_buttons(10, &timeline, 0, Some(&raw)),
+            Buttons::START
+        );
+        // Same clean A whether the reference thinks it is in title mode
+        // (oper==0) or gameplay (oper!=0): the mapping is bypassed.
+        assert_eq!(
+            effective_nes_buttons(30, &timeline, 0, Some(&raw)),
+            Buttons::A
+        );
+        assert_eq!(
+            effective_nes_buttons(30, &timeline, 1, Some(&raw)),
+            Buttons::A
+        );
+        assert_eq!(
+            effective_nes_buttons(45, &timeline, 0, Some(&raw)),
+            Buttons::RIGHT
+        );
+    }
+
+    #[test]
+    fn inline_raw_nes_input_parses_and_sorts() {
+        let events = parse_raw_nes_input("40:start;60:;100:a,right").unwrap();
+        assert_eq!(
+            events,
+            vec![
+                (40, Buttons::START),
+                (60, 0),
+                (100, Buttons::A | Buttons::RIGHT)
+            ]
+        );
     }
 }
