@@ -1466,6 +1466,15 @@ fn run_reference(
                 }
             }
         }
+        if std::env::var("FD_DBG_BANKS").is_ok() && (940..=952).contains(&frame) {
+            eprintln!(
+                "REFBANK frame={frame} SEL=${:02X} R6=${:02X} R7=${:02X} prgmode={}",
+                bus.mmc3.bank_select,
+                bus.mmc3.regs[6],
+                bus.mmc3.regs[7],
+                bus.mmc3.prg_mode()
+            );
+        }
         snaps.push(bus.ram);
     }
     if call_log_frame.is_some() {
@@ -2307,6 +2316,20 @@ fn run_subject(
                 eprintln!("    ${a:04X} <- ${v:02X} @ pc=${pc:04X}");
             }
             bus.watch = None;
+        }
+        if std::env::var("FD_DBG_BANKS").is_ok() && (940..=952).contains(&_frame) {
+            eprintln!(
+                "BANKDBG frame={_frame} BANK_SEL=${:02X} R6=${:02X} R7=${:02X} LOW=${:02X} HIGH=${:02X} slot1={} slot2={} C6=${:02X} C7=${:02X}",
+                bus.ram[0x0B63],
+                bus.ram[0x0B6A],
+                bus.ram[0x0B6B],
+                bus.ram[0x0B70],
+                bus.ram[0x0B71],
+                bus.slot_bank[1],
+                bus.slot_bank[2],
+                bus.ram[0x00C6],
+                bus.ram[0x00C7]
+            );
         }
         snaps.push(snap_nes_ram(&bus));
         if vdp_dump.is_some() || vdp_check.is_some() {
