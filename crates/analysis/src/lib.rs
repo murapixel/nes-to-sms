@@ -30,6 +30,13 @@ pub enum RootKind {
     JumpTableTarget,
     JsrCallee,
     JmpTarget,
+    /// PC reached by a relative branch that falls outside the walked
+    /// function's [entry, upper_bound) range (a backward join below the
+    /// entry, or a forward tail transfer past the walk bound). Such a
+    /// target is real code, so it must be rooted and lifted exactly like a
+    /// JMP target; without this a backward branch (e.g. Mother b28
+    /// `$8CB4 BEQ $8C6E`) stayed an unresolved strict-trap stub.
+    BranchTarget,
 }
 
 impl RootKind {
@@ -40,6 +47,7 @@ impl RootKind {
             RootKind::JumpTableTarget => "JumpTableTarget",
             RootKind::JsrCallee => "JsrCallee",
             RootKind::JmpTarget => "JmpTarget",
+            RootKind::BranchTarget => "BranchTarget",
         }
     }
 }
@@ -347,6 +355,14 @@ fn walk_function(
                         }
                     } else {
                         push_unique(&mut external_refs, target);
+                        // A relative branch that leaves the walked range is
+                        // still a real code edge (backward join below the
+                        // entry, or forward tail past the walk bound). Root
+                        // it in-window like the JMP arm above so the target
+                        // is lifted instead of trapping as unresolved.
+                        if window.contains(target) {
+                            push_unique_root(&mut new_roots, target, RootKind::BranchTarget);
+                        }
                     }
                 }
             }
@@ -1100,6 +1116,35 @@ targets = ["L_8005", "L_804C"]
         assert_eq!(f.addr, 0x8000);
         assert_eq!(f.end, 0x8006);
         assert!(f.internal_labels.contains(&0x8002));
+    }
+
+    // A relative branch to a target below the walked entry (a backward
+    // join) must become its own root so it is lifted. Before this the target
+    // was only reported as an unresolved external ref and the runtime trapped
+    // (Mother b28 `$8CB4 BEQ $8C6E` / `$8CC1 BEQ $8C6B`).
+    #[test]
+    fn backward_branch_target_becomes_root() {
+        // $8002: 60        RTS            <- backward branch target
+        // $8003: EA        NOP
+        // $8004: EA        NOP
+        // $8005: D0 FB     BNE $8002      (rel=$FB=-5 -> $8002)
+        // $8007: 60        RTS
+        let mut prg = empty_prg();
+        prg[0x0002] = 0x60;
+        prg[0x0003] = 0xEA;
+        prg[0x0004] = 0xEA;
+        prg[0x0005] = 0xD0;
+        prg[0x0006] = 0xFB;
+        prg[0x0007] = 0x60;
+        let profile = minimal_profile();
+        let result = analyze(&prg, vectors_reset(0x8005), &profile);
+
+        let target = result
+            .functions
+            .by_addr(0x8002)
+            .expect("backward branch target must be rooted");
+        assert!(target.root_kinds.contains(&RootKind::BranchTarget));
+        assert_eq!(result.class_map.class_at(0x0002), ByteClass::Code);
     }
 
     #[test]

@@ -317,6 +317,34 @@ addr = 0x8bf0
 bank = 28
 addr = 0x8c21
 
+# $8C6E is NOT an MMC3 bank-switch entry (the harvest never logs it):
+# it is the backward branch target of `$8CB4: F0 B8  BEQ $8C6E` inside the
+# harvest-proven b28 $8C9B routine (the $8C21 sprite-state dispatcher falls
+# through to $8C9B, which selects handler $8C71/$8C89/$8C92/$8C9B by sprite
+# type). The reference takes that branch when X==2 and executes $8C6E all
+# the way into $8D55 (FD_TRACE_PC frame=32 bank=28 pc=$8C6E -> pc=$8D55).
+# Bytes: $8C6E = 4C 55 8D (JMP $8D55) — a 3-byte trampoline onto the
+# harvest-proven b28 $8D55 entry (MMC3_ENTRY bank8=28 addr=0x8d55). The
+# analyzer only roots backward relative-branch targets when a JMP reaches
+# them, so $8C6E stayed unresolved; the subject then trapped E1 id=$002A at
+# frame 32 where the reference ran the JMP. Root the byte-verified entry.
+
+# Same class as $8C6E one instruction later: the b28 $8CB6 routine ends its
+# sprite loop with `$8CC1: F0 A8  BEQ $8C6B` (X==3), a backward target below
+# the $8CB6 entry. The reference takes it at frame 32 (FD_TRACE_PC frame=32
+# bank=28 pc=$8C6B) and runs $8C6B = `4C 7F 8D` (JMP $8D7F) — $8D7F is a
+# harvest-proven b28 entry (MMC3_ENTRY bank8=28 addr=0x8d7f). Byte-verified
+# trampoline; root it so the branch stops lowering to an unresolved stub
+# (E1 id=$0028) and traps in the middle of the frame.
+
+[[bank_entry]]
+bank = 28
+addr = 0x8c6b
+
+[[bank_entry]]
+bank = 28
+addr = 0x8c6e
+
 [[bank_entry]]
 bank = 28
 addr = 0x8c9b
