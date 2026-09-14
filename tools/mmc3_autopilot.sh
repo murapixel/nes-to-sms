@@ -42,9 +42,20 @@ touch "$STATE/cycles"
 
 log() { printf '[%s] %s\n' "$(date -u +%FT%TZ)" "$*" >>"$LOG"; echo "$*"; }
 
-# single-instance lock
-exec 9>"$STATE/lock"
-flock -n 9 || { echo "autopilot already running"; exit 1; }
+# single-instance lock (pidfile, NOT flock: launched sessions inherit fds and
+# would keep an flock held after the supervisor exits)
+PIDFILE=$STATE/autopilot.pid
+if [ -f "$PIDFILE" ]; then
+  old=$(cat "$PIDFILE" 2>/dev/null)
+  if [ -n "$old" ] && kill -0 "$old" 2>/dev/null; then
+    echo "autopilot already running (pid $old)"; exit 1
+  fi
+fi
+echo $$ >"$PIDFILE"
+# EXIT removes the pidfile; INT/TERM exit so they trigger the EXIT trap
+# (a bare TERM trap would remove the pidfile and then keep looping).
+trap 'rm -f "$PIDFILE"' EXIT
+trap 'exit 0' INT TERM
 
 is_alive() { [ -n "${1:-}" ] && ps -p "$1" >/dev/null 2>&1; }
 
@@ -111,7 +122,7 @@ rescue_uncommitted() {
 # Last assistant text from the newest session log for an agent prefix.
 last_report() {
   local prefix=$1 f
-  f=$(ls -t /tmp/opencode_"$prefix"_*.json 2>/dev/null | head -n1)
+  f=$(ls -t "$STATE/${prefix}_session_"*.json /tmp/opencode_"${prefix}"_*.json 2>/dev/null | head -n1)
   [ -z "$f" ] && return 0
   log "continuation source: $f"
   python3 - "$f" <<'PY' 2>/dev/null
@@ -132,49 +143,65 @@ PY
 }
 
 continuation_prompt() {
-  local agent=$1 prefix=$2 report
+  local agent=$1 prefix=$2 report hint
   report=$(last_report "$prefix")
+  hint=$(cat "$STATE/${prefix}_task_hint" 2>/dev/null || true)
   cat <<EOF
-Continue your standing assignment (see your agent instructions; 3h stop rule; never invent bank numbers; commit with MMC3: prefix where applicable). An automated supervisor merged any MMC3: commits into mmc3/wip and gated them; start from the current HEAD of your branch and re-check for drift. Your previous session's final report follows — resume from its "remaining tasks"/"recommendations", or report that you are blocked.
+Continue your standing assignment (see your agent instructions; 3h stop rule; never invent bank numbers; commit with MMC3: prefix where applicable). An automated supervisor merged any MMC3: commits into mmc3/wip and gated them; start from the current HEAD of your branch and re-check for drift.
 
---- BEGIN PREVIOUS REPORT ---
+CURRENT OBJECTIVE (authoritative; supersedes stale text below):
+${hint:-Continue the standing MMC3 objective for your role.}
+
+--- BEGIN PREVIOUS SESSION REPORT (may be empty if that session produced none) ---
 $report
---- END PREVIOUS REPORT ---
+--- END PREVIOUS SESSION REPORT ---
 EOF
 }
 
 launch() {
-  local agent=$1 dir=$2 prompt=$3 pfx=$4 logf
+  local agent=$1 dir=$2 prompt=$3 pfx=$4 model_override="${5:-}" logf pid
   logf="$STATE/${pfx}_session_$(date +%s).json"
   if [ "$MODE" = dry-run ]; then
-    log "DRY-RUN: would launch $agent in $dir -> $logf"; return 0
+    log "DRY-RUN: would launch $agent in $dir (model=${model_override:-default}) -> $logf"; return 0
   fi
-  nohup opencode run --agent "$agent" --dir "$dir" --auto --format json "$prompt" >"$logf" 2>&1 &
-  local pid=$!
+  local cmd=(opencode run --agent "$agent" --dir "$dir" --auto --format json)
+  [ -n "$model_override" ] && cmd+=(-m "$model_override")
+  cmd+=("$prompt")
+  nohup "${cmd[@]}" >"$logf" 2>&1 &
+  pid=$!
   write_state "${pfx}_pid" "$pid"
   write_state "${pfx}_log" "$logf"
-  : >"$STATE/${pfx}_lastsz"; : >"$STATE/${pfx}_lasttm"
-  log "launched $agent pid=$pid log=$logf"
+  write_state "${pfx}_started" "$(date +%s)"
+  : >"$STATE/${pfx}_lastsz"
+  log "launched $agent pid=$pid model=${model_override:-default} log=$logf"
 }
 
-# Restart a stalled session. returns 0 if restarted, 1 if stalled out
+# Restart a stalled session. A session is stalled when, for STALL_MIN minutes,
+# its log has not grown AND it has no descendant tool processes (frame-diff,
+# cargo, python...). CPU-time creep alone is NOT treated as progress: a
+# free-tier request parked in epoll_wait still ticks ~3s CPU/min.
+# returns 0 if healthy/restarted, 1 if it stalled (caller relaunches)
 check_stall() {
-  local pfx=$1 pid logf sz tm now lastsz lasttm
+  local pfx=$1 pid logf sz now lastsz last started
   pid=$(read_state "${pfx}_pid"); is_alive "$pid" || return 0
-  logf=$(read_state "${pfx}_log"); [ -f "$logf" ] || return 0
+  logf=$(read_state "${pfx}_log")
+  [ -z "$logf" ] && logf=$(ls -t /tmp/opencode_"$pfx"_*.json 2>/dev/null | head -n1)
+  [ -z "$logf" ] || [ ! -f "$logf" ] && return 0
   sz=$(stat -c %s "$logf" 2>/dev/null || echo 0)
-  tm=$(ps -p "$pid" -o time= 2>/dev/null | tr -d ' ')
-  lastsz=$(read_state "${pfx}_lastsz"); lasttm=$(read_state "${pfx}_lasttm")
+  lastsz=$(read_state "${pfx}_lastsz"); last=$(read_state "${pfx}_lastchange")
   now=$(date +%s)
-  if [ "$sz" != "$lastsz" ] || [ "$tm" != "$lasttm" ]; then
-    write_state "${pfx}_lastsz" "$sz"; write_state "${pfx}_lasttm" "$tm"
-    write_state "${pfx}_lastchange" "$now"
-    return 0
+  started=$(read_state "${pfx}_started"); started=${started:-$now}
+  # grace period: never judge a session younger than STALL_MIN
+  if [ $(( now - started )) -lt $(( STALL_MIN * 60 )) ]; then
+    write_state "${pfx}_lastsz" "$sz"; write_state "${pfx}_lastchange" "$now"; return 0
   fi
-  local last; last=$(read_state "${pfx}_lastchange")
+  # progress: log grew, or any descendant process is alive (real local work)
+  if [ "$sz" != "$lastsz" ] || [ -n "$(pgrep -P "$pid" 2>/dev/null)" ]; then
+    write_state "${pfx}_lastsz" "$sz"; write_state "${pfx}_lastchange" "$now"; return 0
+  fi
   [ -z "$last" ] && { write_state "${pfx}_lastchange" "$now"; return 0; }
   if [ $(( now - last )) -gt $(( STALL_MIN * 60 )) ]; then
-    log "WARN: $pfx session pid=$pid stalled (log/CPU frozen >${STALL_MIN}m); killing"
+    log "WARN: $pfx pid=$pid stalled (no log growth / no children >${STALL_MIN}m); killing"
     kill "$pid" 2>/dev/null; sleep 2
     return 1
   fi
@@ -241,17 +268,24 @@ while true; do
     write_state cycles "$((cycles + 1))"
   fi
 
-  # coverage side
+  # coverage side. Free tier is the default (cheap); after 2 stall restarts
+  # escalate to the paid route for the same model (reliability).
+  cov_model() {
+    local r; r=$(read_state coverage_restarts); r=${r:-0}
+    if [ "$r" -ge 2 ]; then echo "opencode-go/muse-spark-1.3-contributor"; fi
+  }
   cpid=$(read_state coverage_pid)
   if is_alive "$cpid"; then
     if ! check_stall coverage; then
-      launch mmc3-coverage "$WT_COV" "$(continuation_prompt coverage coverage)" coverage
+      r=$(read_state coverage_restarts); r=${r:-0}; r=$(( r + 1 )); write_state coverage_restarts "$r"
+      [ "$r" -ge 2 ] && log "coverage stalled ${r}x -> escalating to PAID muse-spark"
+      launch mmc3-coverage "$WT_COV" "$(continuation_prompt coverage coverage)" coverage "$(cov_model)"
     fi
   else
     [ -n "$cpid" ] && { log "coverage session ended"; stage_seeds; }
     cycles=$(read_state cycles); cycles=${cycles:-0}
     if [ "$cycles" -ge "$MAX_CYCLES" ]; then log "cycle cap ($MAX_CYCLES) reached -> exit"; exit 0; fi
-    launch mmc3-coverage "$WT_COV" "$(continuation_prompt coverage coverage)" coverage
+    launch mmc3-coverage "$WT_COV" "$(continuation_prompt coverage coverage)" coverage "$(cov_model)"
     write_state cycles "$((cycles + 1))"
   fi
 

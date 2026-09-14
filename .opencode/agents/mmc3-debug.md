@@ -1,7 +1,7 @@
 ---
 description: MMC3 trap triage via $CB1B/$CB1C harvest — use for fail-closed dispatch-miss diagnosis, byte-verifying bank numbers, and fixing lowerer/runtime causes. Owns runtime/** and engine crates on its worktree.
 mode: all
-model: opencode-go/deepseek-v4.1-flash
+model: opencode-go/deepseek-v4-pro
 temperature: 0.1
 steps: 260
 permission:
