@@ -51,6 +51,7 @@
 ;   $CB27        Lowerer temporary A spill for stackless LDX/LDY memory loads
 ;   $CB30-$CB61  APU->PSG shim state (see runtime/apu_stub.s)
 ;   $CB73-$CB74  Translated-call diagnostics/scratch (dispatch.s)
+;   $CB75        rt_indirect_jmp diagnostic: last JMP ($xxxx) pointer low byte
 ;   $CB76-$CB77  Translated-call return stack next-free pointer (dispatch.s)
 ;   $D3FC-$D3FD  rt_ppu_write_cont continuation pointer; $D3FE cont-mode flag
 ;   $D46C-$D471  Stackless rotate-memory helper scratch (runtime/flags.s)

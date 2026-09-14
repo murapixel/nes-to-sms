@@ -749,7 +749,12 @@ rt_indirect_jmp:
   ; the pointer instead.
   di                        ; scratch holds incoming A until the tail jump
   ld   (TR_RET_SCRATCH_A), a
-  ld   ($cb75), hl          ; diagnostics: the POINTER's address
+  ; Diagnostics: the pointer site's low byte. This MUST be a single-byte
+  ; store at $CB75. A 16-bit word store there would spill its high byte
+  ; into $CB76, the low byte of TR_RET_PTR, corrupting the translated-call
+  ; continuation stack on every JMP ($xxxx) (Mother frame-32 desync).
+  ld   a, l
+  ld   ($cb75), a
   ld   c, (hl)              ; low byte of target
   inc  hl
   ld   b, (hl)              ; high byte of target
