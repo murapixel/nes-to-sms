@@ -758,8 +758,21 @@ addr = 0x8648
 # re-derived independently by the orchestrator at
 # fileoff = 16 + 19*8192 + (addr-$A000): all match. No [[bank_call]]
 # additions — the new edges are intra-bank JSRs, which need none.
-# NOTE: subject-side overworld re-validation against the current runtime
-# (8aa3175 (zp),Y window routing) is still owed.
+# NOTE: subject-side overworld re-validation (8aa3175 (zp),Y window
+# routing) is BLOCKED, not by a seedable trap, but by WRAM code execution.
+# Trap $E1 unresolved_id=$0002 at frame ~1104: NES $951A (bank 20) does
+# JSR $6047 -> WRAM ($6000-$7FFF). FD_TRACE_PC confirms the reference
+# executes bank=255 (RAM) at $6000/$6047/$6052/$605D (frames 1105-1121).
+# Mother copies a STATIC 3KB code+data blob (10 entry points: $6000,
+# $6047, $6052, $605D, $62AD, $62D8, $62ED, $6303, $631D, $6332) from CHR
+# ROM offset $1E800 into WRAM $6000-$6BFF at the title->game transition,
+# then executes it. The engine classifies $6000-$7FFF as PRG-RAM (data)
+# and has no AnalysisWindow there, so every JSR into $6000-$7FFF emits an
+# unresolved stub. This is an escalation (WRAM-execution support), not a
+# bank_entry/bank_call fix. Static (frame 1200 == 2000), so a static
+# WRAM-code feature (not full dynamic translation) is the fix; est 4-5
+# days engine work. Scoped workaround (hand-written Z80 replacements for
+# the 10 WRAM routines) is possible but game-specific and fragile.
 
 # b19 $B5A5 = A5 28 / 4C 50 C8 (LDA $28; JMP $C850): code.
 [[bank_entry]]
