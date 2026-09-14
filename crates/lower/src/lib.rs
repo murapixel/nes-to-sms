@@ -980,6 +980,29 @@ fn nes_ram_addr_to_sms(nes_addr: u16) -> u16 {
     }
 }
 
+/// SMS address of the two-byte word named by a 6502 `JMP (addr)` pointer
+/// operand, or `None` when that word has no statically-known SMS address.
+///
+/// `rt_indirect_jmp` dereferences exactly two bytes at HL, and its contract
+/// requires HL to already be in SMS address space. The IR operand is the raw
+/// NES pointer *location*, so the lowerer must translate:
+///   * $0000-$1FFF NES RAM / zero page / mirrors -> `$C000-$C7FF` shadow
+///     (zero page `$00-$FF` maps to `NES_ZP_BASE + addr`).
+///   * $6000-$7FFF NES SRAM -> numerically identical SMS EXRAM address.
+///   * $8000-$BFFF low PRG on a non-MMC3 layout -> raw address: the SMS
+///     project mirrors NES `$8000-$BFFF` into slot 2.
+///   * anything else (MMC3 live windows, `$C000+` PRG, PPU) -> `None`: the
+///     backing byte is not statically addressable, so the site must fail
+///     closed rather than dereference an unrelated SMS byte.
+fn indirect_ptr_sms(addr: u16, mmc3_windowed: bool) -> Option<u16> {
+    match addr {
+        0x0000..=0x1FFF => Some(nes_ram_addr_to_sms(addr)),
+        0x6000..=0x7FFF => Some(addr),
+        0x8000..=0xBFFF if !mmc3_windowed => Some(addr),
+        _ => None,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Private helpers
 // ---------------------------------------------------------------------------
@@ -5117,7 +5140,20 @@ pub fn lower_routine(
             }
 
             Op::JmpIndirect { addr } => {
-                program.ld_hl_imm(*addr);
+                // The 6502 operand names the pointer *location*, not the
+                // target. rt_indirect_jmp dereferences HL and its contract
+                // requires HL to already be an SMS-space address, so map the
+                // location here. Emitting the raw NES address made Mother's
+                // `JMP ($007C)` read SMS ROM $007C instead of ZP $C07C.
+                let Some(sms_ptr) = indirect_ptr_sms(*addr, mmc3_windowed) else {
+                    return Err(LowerError::UnsupportedOp {
+                        pc: None,
+                        reason: format!(
+                            "JMP (${addr:04X}): pointer location has no statically addressable SMS address"
+                        ),
+                    });
+                };
+                program.ld_hl_imm(sms_ptr);
                 program.jp(INDIRECT_JMP);
             }
 
@@ -7017,11 +7053,45 @@ runtime_label = "rt_replacement"
     // JmpIndirect
     // -------------------------------------------------------------------
     #[test]
-    fn jmp_indirect_3000() {
-        let build = lower_and_finish(vec![Op::JmpIndirect { addr: 0x3000 }]);
-        // ld hl,$3000 = 21 00 30
-        assert!(build.bytes.windows(3).any(|w| w == [0x21, 0x00, 0x30]));
+    fn jmp_indirect_zero_page_remapped_to_zp_mirror() {
+        // The operand is the pointer *location*; rt_indirect_jmp dereferences
+        // HL, so it must be remapped into SMS space. NES ZP $007C -> $C07C.
+        // Emitting the raw $007C made Mother's `JMP ($007C)` read SMS ROM
+        // bytes (CB 32) instead of the real target word.
+        let build = lower_and_finish(vec![Op::JmpIndirect { addr: 0x007C }]);
+        // ld hl,$C07C = 21 7C C0
+        assert!(build.bytes.windows(3).any(|w| w == [0x21, 0x7C, 0xC0]));
         assert!(build.asm.contains("jp rt_indirect_jmp"));
+    }
+
+    #[test]
+    fn jmp_indirect_ram_mirror_remapped() {
+        // $07F8 folds into the NES RAM shadow at $C7F8.
+        let build = lower_and_finish(vec![Op::JmpIndirect { addr: 0x07F8 }]);
+        // ld hl,$C7F8 = 21 F8 C7
+        assert!(build.bytes.windows(3).any(|w| w == [0x21, 0xF8, 0xC7]));
+    }
+
+    #[test]
+    fn jmp_indirect_mmc3_prg_window_fails_closed() {
+        // Under MMC3 the $8000-$BFFF window shows live banks, so a pointer
+        // stored there has no statically addressable SMS location. Fail
+        // closed instead of reading an unrelated SMS byte.
+        let prof = mmc3_test_profile();
+        let opts = LowerOptions {
+            profile: Some(&prof),
+            emit_source_comments: true,
+            routine_flag_reads: None,
+        };
+        let routine = make_routine(
+            "test_routine",
+            vec![Op::JmpIndirect { addr: 0x8000 }, Op::Rts],
+        );
+        let mut prog = z80_emit::Program::new();
+        define_runtime_stubs(&mut prog);
+        prog.org(0x0000);
+        let err = lower_routine(&mut prog, &routine, &opts).unwrap_err();
+        assert!(format!("{err}").contains("JMP ($8000)"), "{err}");
     }
 
     // -------------------------------------------------------------------
