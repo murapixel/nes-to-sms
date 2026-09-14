@@ -2033,6 +2033,30 @@ fn run_subject(
     // during the debug frame. Defaults to $0001 (the first divergence).
     let watch_list = parse_watch_list();
 
+    // FD_TRACE_PC_SUBJ=759A,75BC: log the subject's Z80 register state
+    // (A, X=D, Y=E, F, SP) whenever the SMS CPU executes one of the listed
+    // PCs. The reference-side FD_TRACE_PC is NES-address based; this is the
+    // subject analogue for naming a diverging translated instruction.
+    let trace_pc_subj: Vec<u16> = std::env::var("FD_TRACE_PC_SUBJ")
+        .ok()
+        .map(|spec| {
+            spec.split(',')
+                .filter_map(|raw| {
+                    u16::from_str_radix(
+                        raw.trim().trim_start_matches("0x").trim_start_matches('$'),
+                        16,
+                    )
+                    .ok()
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let trace_pc_subj_limit = std::env::var("FD_TRACE_PC_SUBJ_LIMIT")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(300);
+    let mut trace_pc_subj_hits = 0usize;
+
     // FD_MEASURE_NMI=1 — measure the per-frame NMI cost (instructions from
     // IRQ-inject until the stack unwinds back, i.e. the NMI chain returns to
     // the main wait-loop). This is the real per-frame work that must fit in
@@ -2114,6 +2138,13 @@ fn run_subject(
                 break;
             }
             bus.last_pc = cpu.pc;
+            if trace_pc_subj_hits < trace_pc_subj_limit && trace_pc_subj.contains(&cpu.pc) {
+                eprintln!(
+                    "SUBJ_TRACE_PC frame={_frame} pc=${:04X} A=${:02X} X=${:02X} Y=${:02X} F=${:02X} SP=${:04X}",
+                    cpu.pc, cpu.a, cpu.d, cpu.e, cpu.f, cpu.sp
+                );
+                trace_pc_subj_hits += 1;
+            }
             let cyc0 = cpu.cycles;
             if cpu.step(&mut bus).is_err() {
                 break;

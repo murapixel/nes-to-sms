@@ -33,49 +33,51 @@ addr = 0xFA38
 name = "Task8Loop"
 
 # NMI task vector table at $F99F (10 entries, dispatched via
-# LDA $F9A0,X / LDA $F99F,X + PHA/PHA/RTS — invisible to static discovery,
-# so every task dispatch missed and silently realigned). Rooted explicitly;
-# without these the $E5 task protocol deadlocks ($E6 never set, $BB never
-# updated). Table ends at task 9 ($FA57); task 10+ decode as garbage.
+# LDA $F9A0,X / LDA $F99F,X + PHA/PHA/RTS). The table stores `target-1`
+# (the classic 6502 RTS-dispatch idiom: RTS pops the pushed word and then
+# increments PC), so the root must be the EFFECTIVE entry `word+1`, not the
+# raw word. Rooting the raw word put no dispatch-table record at the address
+# the runtime requests; rt_banked_tail_dispatch then took its misaligned-
+# return realignment path and jumped to the NEXT lifted boundary, so a
+# type-4 palette flush ran task 5's body instead. Byte-verified: every raw
+# word is the high byte of the preceding `JMP $F8BD` (or the last table
+# byte), and `word+1` is the first real instruction (INY / LDA / JSR).
+# Table ends at task 9 ($FA57 -> $FA58); task 10+ decode as garbage.
 
 [[function]]
-addr = 0xF8BC
+addr = 0xF8BD
 name = "NmiTask0"
 
 [[function]]
-addr = 0xF9B2
+addr = 0xF9B3
 name = "NmiTask1"
 
 [[function]]
-addr = 0xF9B6
+addr = 0xF9B7
 name = "NmiTask2"
 
 [[function]]
-addr = 0xF9C0
+addr = 0xF9C1
 name = "NmiTask3"
 
 [[function]]
-addr = 0xF9C8
+addr = 0xF9C9
 name = "NmiTask4"
 
 [[function]]
-addr = 0xF9F1
+addr = 0xF9F2
 name = "NmiTask5"
 
 [[function]]
-addr = 0xF9FE
+addr = 0xF9FF
 name = "NmiTask6"
 
 [[function]]
-addr = 0xFA17
+addr = 0xFA18
 name = "NmiTask7"
 
 [[function]]
-addr = 0xFA37
-name = "NmiTask8"
-
-[[function]]
-addr = 0xFA57
+addr = 0xFA58
 name = "NmiTask9"
 
 # (Deadlock-diagnostic stubs REMOVED 2026-09-08: testing faithful boot with
