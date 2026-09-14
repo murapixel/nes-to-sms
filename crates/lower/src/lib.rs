@@ -3211,8 +3211,8 @@ fn emit_cond_dec_loop(program: &mut z80_emit::Program, plan: &CondDecLoopPlan) {
 /// LDA (zp),Y). Mirrors rt_read_zp_ptr_y: 16-bit pointer from the zp pair,
 /// + Y, then RAM/mirror remap or a fixed-high PRG helper read. `zp = $FF`
 /// (page-wrap pair) keeps the helper. A := byte; clobbers BC/HL/flags.
-fn emit_read_zp_ptr_y_inline(p: &mut z80_emit::Program, zp: u8) {
-    use runtime_symbols::READ_ZP_PTR_Y;
+fn emit_read_zp_ptr_y_inline(p: &mut z80_emit::Program, zp: u8, mmc3_windowed: bool) {
+    use runtime_symbols::{MMC3_READ_WINDOW, READ_ZP_PTR_Y};
     if zp == 0xFF {
         p.ld_b_imm(zp);
         p.call(READ_ZP_PTR_Y);
@@ -3221,6 +3221,7 @@ fn emit_read_zp_ptr_y_inline(p: &mut z80_emit::Program, zp: u8) {
     let high = p.fresh_label("rzpy_high");
     let deref = p.fresh_label("rzpy_deref");
     let mirror = p.fresh_label("rzpy_mirror");
+    let win = p.fresh_label("rzpy_win");
     let done = p.fresh_label("rzpy_done");
     p.ld_hl_abs(sms_layout::NES_ZP_BASE + zp as u16);
     p.ld_c_e();
@@ -3236,10 +3237,27 @@ fn emit_read_zp_ptr_y_inline(p: &mut z80_emit::Program, zp: u8) {
     p.jr(&deref);
     p.label(&mirror);
     p.cp_imm(0x20);
-    p.jr_nc(&deref);
+    p.jr_nc(&win);
     p.and_imm(0x07);
     p.add_a_imm(0xC0);
     p.ld_h_a();
+    p.jr(&deref);
+    p.label(&win);
+    if mmc3_windowed {
+        // MMC3: $8000-$BFFF is the switchable window. HL already holds the
+        // NES address and A holds H ($20-$BF here), so route $80-$BF
+        // through the live R6/R7 shadow read; $20-$7F (PPU/APU regs) is
+        // not valid pointer data and keeps the legacy direct dereference.
+        let window = p.fresh_label("rzpy_window");
+        p.cp_imm(0x80);
+        p.jr_nc(&window);
+        p.jr(&deref);
+        p.label(&window);
+        p.call(MMC3_READ_WINDOW);
+        p.jr(&done);
+    } else {
+        p.jr(&deref);
+    }
     p.label(&deref);
     p.ld_a_hl_ptr();
     p.jr(&done);
@@ -4017,7 +4035,7 @@ pub fn lower_routine(
                         program.ld_a_hl_ptr();
                     }
                     (AddrExpr::IndirectY(zp), _) => {
-                        emit_read_zp_ptr_y_inline(program, *zp);
+                        emit_read_zp_ptr_y_inline(program, *zp, mmc3_windowed);
                     }
                     (AddrExpr::IndirectX(zp), _) => {
                         program.comment("WARN: IndirectX LDA not fully implemented");
@@ -6531,6 +6549,39 @@ chr_kib = 8
             !build
                 .asm
                 .contains("WARN: unresolved StaMem addressing mode")
+        );
+    }
+
+    #[test]
+    fn mmc3_indirect_y_window_read_routes_through_shadow_helper() {
+        let prof = mmc3_test_profile();
+        let opts = LowerOptions {
+            profile: Some(&prof),
+            emit_source_comments: true,
+            routine_flag_reads: None,
+        };
+        let routine = make_routine(
+            "test_routine",
+            vec![
+                Op::LdaMem {
+                    addr: AddrExpr::IndirectY(0xC6),
+                    region: MemRegion::PrgRom,
+                },
+                Op::Rts,
+            ],
+        );
+        let mut prog = z80_emit::Program::new();
+        define_runtime_stubs(&mut prog);
+        prog.org(0x0000);
+        lower_routine(&mut prog, &routine, &opts).unwrap();
+        let build = prog.finish().unwrap();
+        // (zp),Y into the $8000-$BFFF switchable window must resolve through
+        // the live R6/R7 shadows, not a direct slot-1 dereference (frame-950
+        // Mother sprite-decompression divergence read half 20 instead of 21).
+        assert!(
+            build.asm.contains("call rt_mmc3_read_window"),
+            "MMC3 (zp),Y window dereference must route through the shadow helper:\n{}",
+            build.asm
         );
     }
 

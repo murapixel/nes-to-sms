@@ -1698,6 +1698,13 @@ rt_read_zp_ptr_y:
   jr   c, _rzpy_remap_ram
   cp   $20
   jr   c, _rzpy_remap_mirror
+.ifdef NES_MMC3
+  ; $8000-$BFFF is the MMC3 switchable window: dereference through the live
+  ; R6/R7 shadows (rt_mmc3_read_window preserves BC/DE/HL, byte in A).
+  cp   $80
+  jr   c, _rzpy_deref
+  jp   rt_mmc3_read_window
+.endif
   jr   _rzpy_deref
 _rzpy_remap_ram:
   ld   a, h
