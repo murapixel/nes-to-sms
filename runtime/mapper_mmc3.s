@@ -149,13 +149,22 @@ _mmw_bank_data:
   jr  z, _mmw_data_r7
   ; R0-R5: CHR bank change -> variants go stale; the NMI presentation
   ; flush refreshes them (rt_mmc3_chr_sync). R0-R5 shadows are contiguous.
+  ; The index add must not clobber DE: D/E are the resident translated
+  ; X/Y and callers (e.g. fixed $CFC8's JSR $FFD0 restore loop, which keeps
+  ; the slot index in X across the call) reuse them after return. A bare
+  ; `ld d,$00` here zeroed X, so the loop descended $FF.. and STA $F0,X
+  ; wrapped into zero page ($EB-$EF, notably $EC), which later took the
+  ; NMI $F8DA BEQ-not-taken path, enabled IRQ via STX $E001, and dispatched
+  ; through zeroed $0540 into the $0001 banked-dispatch miss.
   ld  b, a                    ; B = reg index 0-5
   ld  a, c                    ; A = value
+  push de                     ; preserve resident X/Y across indexing
   ld  hl, MMC3_R0
   ld  d, $00
   ld  e, b
   add hl, de
   ld  (hl), a
+  pop de                      ; restore resident X/Y
   ld  a, $01
   ld  (MMC3_CHR_DIRTY), a
   jr  _mmw_done
