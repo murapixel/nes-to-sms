@@ -1121,20 +1121,17 @@ _cv1_first_nmi_ready:
   ld  ($cb1a), a
 
 _irq_call_translated_nmi:
-  ; Bound translated-NMI nesting. An overlong game handler may receive one
-  ; light nested handler, but deeper re-entry exhausts the native stack.
-  ; CV1's full handler normally clears $1B and RTIs after its game work.
-  ; MMC3 Mother nests productively (outer task-8 $FDBB wait unblocks via a
-  ; nested dispatch that clears $E5), so its bound is roomier.
-.ifdef NES_MMC3
-  ld  a, ($ca11)
-  cp  8
-  jp  nc, _irq_skip_translated_nmi
-.else
+  ; Bound translated-NMI nesting to the depth the interrupted slot-1 bank
+  ; save can represent ($CB25 depth 0 / $CB26 depth 1). An overlong game
+  ; handler may receive one light nested handler; deeper re-entry must skip
+  ; rather than run, because a depth-2 save would overwrite the depth-1
+  ; saved bank and the depth-1 exit would then resume the interrupted
+  ; thread in the wrong slot-1 bank (Mother frame-46 $4D1D desync).
+  ; NES NMIs do not nest at all: a second VBlank edge just latches pending,
+  ; so skipping the over-nested body is also the more faithful model.
   ld  a, ($ca11)
   cp  2
   jp  nc, _irq_skip_translated_nmi
-.endif
 .ifdef CV1_RUNTIME_HOOKS
   ; Pending output backpressures a NEW full producer, not an already-running
   ; busy game body or its valid lag NMI. Do this before CB12/CB20 phase resets.
