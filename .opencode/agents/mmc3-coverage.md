@@ -3,7 +3,7 @@ description: MMC3 coverage grind — harvest fixed-to-window refs and grow profi
 mode: all
 model: opencode/muse-spark-1.3-contributor-free
 temperature: 0.2
-steps: 60
+steps: 160
 permission:
   edit:
     "/tmp/*": allow
