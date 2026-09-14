@@ -211,10 +211,13 @@ check_stall() {
 # Extract TOML blocks from the newest coverage report into $SEEDS (review only).
 stage_seeds() {
   local f
-  f=$(ls -t /tmp/opencode_coverage_*.json 2>/dev/null | head -n1)
+  f=$(ls -t "$STATE/coverage_session_"*.json /tmp/opencode_coverage_*.json 2>/dev/null | head -n1)
   [ -z "$f" ] && return 0
   [ "$MODE" = dry-run ] && { log "DRY-RUN: would scan $f for TOML blocks"; return 0; }
-  python3 - "$f" "$SEEDS" <<'PY' 2>/dev/null
+  # never clobber an already-staged (possibly human-curated) file
+  local target="$SEEDS"
+  [ -s "$SEEDS" ] && target="$SEEDS.new"
+  python3 - "$f" "$target" <<'PY' 2>/dev/null
 import json, re, sys
 texts = []
 for line in open(sys.argv[1]):
@@ -238,8 +241,8 @@ for ln in "\n".join(texts).splitlines():
 if blocks:
     open(sys.argv[2], 'w').write("\n\n".join("\n".join(b) for b in blocks) + "\n")
 PY
-  if [ -s "$SEEDS" ]; then
-    log "STAGED $(grep -c '^\[\[' "$SEEDS") TOML block(s) -> $SEEDS (REVIEW ONLY; not applied)"
+  if [ -s "$SEEDS" ] || [ -s "$SEEDS.new" ]; then
+    log "STAGED $(grep -c '^\[\[' "$target") TOML block(s) -> $target (REVIEW ONLY; not applied)"
   fi
 }
 
