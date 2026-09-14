@@ -52,7 +52,10 @@ if [ -f "$PIDFILE" ]; then
   fi
 fi
 echo $$ >"$PIDFILE"
-trap 'rm -f "$PIDFILE"' EXIT INT TERM
+# EXIT removes the pidfile; INT/TERM exit so they trigger the EXIT trap
+# (a bare TERM trap would remove the pidfile and then keep looping).
+trap 'rm -f "$PIDFILE"' EXIT
+trap 'exit 0' INT TERM
 
 is_alive() { [ -n "${1:-}" ] && ps -p "$1" >/dev/null 2>&1; }
 
