@@ -773,6 +773,20 @@ addr = 0x8648
 # WRAM-code feature (not full dynamic translation) is the fix; est 4-5
 # days engine work. Scoped workaround (hand-written Z80 replacements for
 # the 10 WRAM routines) is possible but game-specific and fragile.
+# Addendum (re-verified at ec7b8b3, current runtime): the blob is
+# byte-identical to CHR offset $1E800 (SRAM dump $6000-$6BFF == CHR
+# bytes). The copy is IRQ-driven PPU reads (bank31 $CEE8/$FFD0 maps CHR
+# bank $7A via MMC3 R1, copies 64B pages into $0404, then to WRAM), so
+# it implicates the phase-4 CHR live path - BUT the blob is static, so a
+# static WRAM-code feature can bake it from CHR ROM at build time and
+# does NOT need runtime CHR reads. A SECOND RAM-execution surface also
+# exists: the NMI handler (bank31 $F98E: LDA $D7 / BEQ / JSR $00D7)
+# calls a zero-page-resident callback at $00D7 when [$00D7]!=0 - yet
+# another unresolved label (L_00D7, id 0) that is NOT seedable. Total
+# unresolved labels: 25; 11 are RAM targets ($00D7 + 10 WRAM), 14 are
+# bank-dispatch misses ($963D/$9786/$97B0/$A3F8/$A92F/$AB09/$B777/
+# $B79B/$B7A4/$BC73/$BCAA/$D23E/$D628/$E09C) reachable only AFTER the
+# RAM-execution blockers are cleared.
 
 # b19 $B5A5 = A5 28 / 4C 50 C8 (LDA $28; JMP $C850): code.
 [[bank_entry]]
