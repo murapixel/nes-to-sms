@@ -13,6 +13,19 @@ irq = 0xFE7B
 mode = "action"
 pause_start = true
 
+# Static WRAM code blob (see the WRAM-code blocker grounding at the
+# overworld bank-entry block, $951A JSR $6047). Mother copies 3 KiB from
+# CHR ROM offset $1E800 to WRAM $6000-$6BFF at the title->game transition
+# and executes it. 10 reference-grounded entry points (FD_TRACE_PC
+# bank=255 at frames 1105-1121, byte-identical at frames 1200/2000).
+# The engine lifts these from the blob bytes; JSRs into $6000-$7FFF
+# dispatch to the translated routines.
+[[wram_blob]]
+source = 0x1E800
+dest = 0x6000
+length = 0xC00
+entries = [0x6000, 0x6047, 0x6052, 0x605D, 0x62AD, 0x62D8, 0x62ED, 0x6303, 0x631D, 0x6332]
+
 # Dynamically-reached fixed code (no static refs, found via dispatch-miss
 # $CB1B/$CB1C harvest): $CA89 is a JMP ($007C) transfer target (transfer
 # loop reached every ~7k steps). Rooted so dispatch hits exactly instead

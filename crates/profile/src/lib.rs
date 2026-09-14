@@ -32,6 +32,13 @@ pub struct Profile {
     pub ram_tags: Vec<RamTag>,
     #[serde(default, rename = "chr_pack")]
     pub chr_packs: Vec<ChrPackRange>,
+    /// Static WRAM code blobs (mapper 4): a byte range in CHR ROM that the
+    /// game copies into WRAM ($6000-$7FFF) at runtime and then executes.
+    /// The engine lifts each declared entry point from the blob bytes so a
+    /// JSR into WRAM resolves to a translated routine instead of an
+    /// unresolved strict-trap stub.
+    #[serde(default, rename = "wram_blob")]
+    pub wram_blobs: Vec<WramBlob>,
     /// `JSR JumpEngine`-style dispatch sites. Each entry maps a call
     /// site to the inline `.dd2` target table that follows it in the
     /// original NES PRG. The lifter substitutes the JSR with a direct
@@ -413,6 +420,19 @@ pub struct ChrPackRange {
     pub dest: u16,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WramBlob {
+    /// Byte offset into CHR ROM holding the blob image.
+    pub source: u32,
+    /// WRAM destination address (must be within $6000-$7FFF).
+    pub dest: u16,
+    /// Blob length in bytes.
+    pub length: u16,
+    /// Code entry points (WRAM addresses within [dest, dest+length)).
+    pub entries: Vec<u16>,
+}
+
 #[derive(Debug)]
 pub enum LoadError {
     Io(std::io::Error),
@@ -684,6 +704,36 @@ fn validate(p: &Profile) -> Result<(), LoadError> {
                 )));
             }
             *used = true;
+        }
+    }
+    for blob in &p.wram_blobs {
+        if blob.entries.is_empty() {
+            return Err(LoadError::Validation(format!(
+                "wram_blob at ${:04X} must declare at least one entry",
+                blob.dest
+            )));
+        }
+        if blob.dest < 0x6000 || blob.length == 0 {
+            return Err(LoadError::Validation(format!(
+                "wram_blob dest ${:04X} must be in $6000-$7FFF with nonzero length",
+                blob.dest
+            )));
+        }
+        let end = u32::from(blob.dest) + u32::from(blob.length);
+        if end > 0x8000 {
+            return Err(LoadError::Validation(format!(
+                "wram_blob ${:04X}+${:04X} exceeds $7FFF",
+                blob.dest, blob.length
+            )));
+        }
+        for entry in &blob.entries {
+            if *entry < blob.dest || u32::from(*entry) >= end {
+                return Err(LoadError::Validation(format!(
+                    "wram_blob entry ${entry:04X} outside ${:04X}..${:04X}",
+                    blob.dest,
+                    end - 1
+                )));
+            }
         }
     }
     Ok(())
@@ -1226,6 +1276,70 @@ chr_kib = 8
             .payload_sha256
             .is_none()
         );
+    }
+
+    #[test]
+    fn parses_wram_blob() {
+        let p = load_from_str(
+            r#"
+[rom]
+name = "x"
+mapper = 4
+prg_kib = 256
+chr_kib = 128
+
+[[wram_blob]]
+source = 0x1E800
+dest = 0x6000
+length = 0xC00
+entries = [0x6000, 0x6047, 0x6052]
+"#,
+        )
+        .unwrap();
+        assert_eq!(p.wram_blobs.len(), 1);
+        assert_eq!(p.wram_blobs[0].source, 0x1E800);
+        assert_eq!(p.wram_blobs[0].dest, 0x6000);
+        assert_eq!(p.wram_blobs[0].entries, vec![0x6000, 0x6047, 0x6052]);
+    }
+
+    #[test]
+    fn rejects_wram_blob_entry_out_of_range() {
+        let bad = [
+            // entry below dest
+            "dest = 0x6000
+length = 0xC00
+entries = [0x5FFF]",
+            // entry past the blob end
+            "dest = 0x6000
+length = 0xC00
+entries = [0x6C00]",
+            // empty entries
+            "dest = 0x6000
+length = 0xC00
+entries = []",
+            // blob exceeds $7FFF
+            "dest = 0x7000
+length = 0x2000
+entries = [0x7000]",
+        ];
+        for body in bad {
+            let src = format!(
+                "[rom]
+name = \"x\"
+mapper = 4
+prg_kib = 256
+chr_kib = 128
+
+[[wram_blob]]
+source = 0x1E800
+{body}
+"
+            );
+            assert!(
+                matches!(load_from_str(&src), Err(LoadError::Validation(_))),
+                "expected validation failure for: {body}"
+            );
+        }
     }
 
     #[test]
