@@ -119,7 +119,7 @@ rescue_uncommitted() {
 # Last assistant text from the newest session log for an agent prefix.
 last_report() {
   local prefix=$1 f
-  f=$(ls -t /tmp/opencode_"$prefix"_*.json 2>/dev/null | head -n1)
+  f=$(ls -t "$STATE/${prefix}_session_"*.json /tmp/opencode_"${prefix}"_*.json 2>/dev/null | head -n1)
   [ -z "$f" ] && return 0
   log "continuation source: $f"
   python3 - "$f" <<'PY' 2>/dev/null
@@ -140,14 +140,18 @@ PY
 }
 
 continuation_prompt() {
-  local agent=$1 prefix=$2 report
+  local agent=$1 prefix=$2 report hint
   report=$(last_report "$prefix")
+  hint=$(cat "$STATE/${prefix}_task_hint" 2>/dev/null || true)
   cat <<EOF
-Continue your standing assignment (see your agent instructions; 3h stop rule; never invent bank numbers; commit with MMC3: prefix where applicable). An automated supervisor merged any MMC3: commits into mmc3/wip and gated them; start from the current HEAD of your branch and re-check for drift. Your previous session's final report follows — resume from its "remaining tasks"/"recommendations", or report that you are blocked.
+Continue your standing assignment (see your agent instructions; 3h stop rule; never invent bank numbers; commit with MMC3: prefix where applicable). An automated supervisor merged any MMC3: commits into mmc3/wip and gated them; start from the current HEAD of your branch and re-check for drift.
 
---- BEGIN PREVIOUS REPORT ---
+CURRENT OBJECTIVE (authoritative; supersedes stale text below):
+${hint:-Continue the standing MMC3 objective for your role.}
+
+--- BEGIN PREVIOUS SESSION REPORT (may be empty if that session produced none) ---
 $report
---- END PREVIOUS REPORT ---
+--- END PREVIOUS SESSION REPORT ---
 EOF
 }
 
