@@ -22,6 +22,21 @@ pause_start = true
 addr = 0xCA89
 name = "XferCA89"
 
+# Second JMP ($007C) transfer target in the same $C9B5 transfer loop. That
+# routine sets the pointer explicitly at $C9D2-$C9D8 (`LDY #$C7; STY $7C;
+# LDY #$C9; STY $7D`), then `JMP $CA19`; the loop later does `JMP ($007C)`
+# and must re-enter at $C9C7. Rooted because $C9C7 is the JSR $CBBD return
+# continuation at $C9C4 (also reached as a routine-interior label), so the
+# analyzer never made it a dispatch-table record. Without it the runtime's
+# _btd_miss next-boundary realignment silently lands on the next lifted
+# boundary $C9E5 (`DEC $77`) and runs the sibling routine. Byte-verified:
+# $C9C7 = C6 7F (DEC $7F); reference FD_TRACE_PC frame=32 bank=30 pc=$CAAC
+# -> pc=$C9C7. Overlaps the $C9B5 walk — same bytes, entry label only.
+
+[[function]]
+addr = 0xC9C7
+name = "XferC9C7"
+
 # Indirect-transfer hot entry (every frame via JMP ($007C)): $FA38 is
 # task-8's streaming-loop interior (INY; LDX $0400,Y; ...). No static refs
 # (data-driven pointer); without a record every dispatch misses. Rooted so
