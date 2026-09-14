@@ -741,3 +741,57 @@ addr = 0x82b1
 [[bank_entry]]
 bank = 28
 addr = 0x8648
+
+# Overworld harvest — FIRST seeds beyond the title/menu/dialogue area.
+# The name-registration wall was broken with the FD_PAD_RAW decoupled
+# stimulus knob (9cd63c4): title -> 5 kana registrations (4 names +
+# favourite food, 1 char each) -> summary はい -> message speed ->
+# prologue -> overworld. Harvest: FD_LOG_BANK_ENTRIES=1
+# FD_PAD_RAW=/tmp/toolchain/mother_ow_harvest.txt, 60000 frames,
+# --ref-only; PPMs /tmp/toolchain/motherout-ow/ ref_14000/42000/50000/
+# 54000 show Ninten's room + コマンド (はなす/チェック/グッズ), the
+# だれに はなしているのだ talk prompt, and the キャッシュカード goods
+# screen. 93 unique MMC3_ENTRY, 86 already seeded; these 7 are the
+# unseeded remainder, all bank 19 HIGH (overworld/menu code).
+# Bank mapping locked against known anchors (b28 $8000 = 4C 7D 82
+# JMP $827D; b19 $BF62 = 20 95 BF JSR $BF95), and every byte below was
+# re-derived independently by the orchestrator at
+# fileoff = 16 + 19*8192 + (addr-$A000): all match. No [[bank_call]]
+# additions — the new edges are intra-bank JSRs, which need none.
+# NOTE: subject-side overworld re-validation against the current runtime
+# (8aa3175 (zp),Y window routing) is still owed.
+
+# b19 $B5A5 = A5 28 / 4C 50 C8 (LDA $28; JMP $C850): code.
+[[bank_entry]]
+bank = 19
+addr = 0xb5a5
+
+# b19 $B8AC = 20 B7 C4 / A2 FF E8 E0 03 (JSR $C4B7; LDX #$FF loop): code.
+[[bank_entry]]
+bank = 19
+addr = 0xb8ac
+
+# b19 $B8F9 = 20 A5 B5 (JSR $B5A5, same-harvest sibling) + pointer-add: code.
+[[bank_entry]]
+bank = 19
+addr = 0xb8f9
+
+# b19 $BBE0 = A9 EB A2 BB 85 80 86 81 4C 18 F0 (ptr-init; JMP $F018): code.
+[[bank_entry]]
+bank = 19
+addr = 0xbbe0
+
+# b19 $BC08 = 20 50 C8 (JSR $C850) + pointer-add (ADC #$38): code.
+[[bank_entry]]
+bank = 19
+addr = 0xbc08
+
+# b19 $BC27 = A9 0A A2 07 A0 05 85 70 84 77 (LDA/LDX/LDY imm init block): code.
+[[bank_entry]]
+bank = 19
+addr = 0xbc27
+
+# b19 $BC96 = 20 C6 BC (JSR $BCC6, already-seeded) + LDA ($60),Y pair: code.
+[[bank_entry]]
+bank = 19
+addr = 0xbc96
