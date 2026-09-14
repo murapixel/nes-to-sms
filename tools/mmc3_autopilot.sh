@@ -42,9 +42,17 @@ touch "$STATE/cycles"
 
 log() { printf '[%s] %s\n' "$(date -u +%FT%TZ)" "$*" >>"$LOG"; echo "$*"; }
 
-# single-instance lock
-exec 9>"$STATE/lock"
-flock -n 9 || { echo "autopilot already running"; exit 1; }
+# single-instance lock (pidfile, NOT flock: launched sessions inherit fds and
+# would keep an flock held after the supervisor exits)
+PIDFILE=$STATE/autopilot.pid
+if [ -f "$PIDFILE" ]; then
+  old=$(cat "$PIDFILE" 2>/dev/null)
+  if [ -n "$old" ] && kill -0 "$old" 2>/dev/null; then
+    echo "autopilot already running (pid $old)"; exit 1
+  fi
+fi
+echo $$ >"$PIDFILE"
+trap 'rm -f "$PIDFILE"' EXIT INT TERM
 
 is_alive() { [ -n "${1:-}" ] && ps -p "$1" >/dev/null 2>&1; }
 
