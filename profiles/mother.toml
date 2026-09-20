@@ -157,6 +157,36 @@ name = "NmiTask7"
 addr = 0xFA58
 name = "NmiTask9"
 
+# Title->game transition WRAM-code path hits three overlapping-code entry
+# points in the fixed 16K window ($C000-$FFFF, bank 30/31) that the walker
+# cannot materialize on its own. Each is a 6502 "instruction-interior"
+# branch/JSR target that reuses the tail bytes of a preceding instruction:
+#
+#  func_D22F ($D22F):  $D239 BEQ $D23E -> $D23E = tail of
+#      $D23D BIT $11A5 (bytes A5 11) = LDA $11 (skip the LDA $13 arm).
+#  func_D617 ($D617):  $D623 BEQ $D628 -> $D628 = tail of
+#      $D627 BIT $11A5 = LDA $11 (same idiom).
+#  func_E093 ($E093):  JSR $E09C -> $E09C = LDY $69; LDA $36, sharing its
+#      STA ($6A),Y; RTS tail with the $E099 BEQ $E0A0 path.
+#
+# Without roots these stay unresolved (dispatch id $0C/$0D/$0E) and their
+# stubs are placed in a different slot than the referencing bank, so the
+# absolute `jp z,L_XXXX` wild-jumps into the middle of a push helper and
+# executes an IX prefix (0xFD) instead of trapping cleanly. Rooted as entry
+# labels only (same bytes, overlap the enclosing walk) — see XferC9C7 below.
+
+[[function]]
+addr = 0xD23E
+name = "FuncD23E"
+
+[[function]]
+addr = 0xD628
+name = "FuncD628"
+
+[[function]]
+addr = 0xE09C
+name = "FuncE09C"
+
 # (Deadlock-diagnostic stubs REMOVED 2026-09-08: testing faithful boot with
 # DIAG_DELAYNMI head-start instead. Re-add only if faithful path deadlocks.)
 
