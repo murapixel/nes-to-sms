@@ -188,9 +188,8 @@ _gv_mmc3_have_k:
   add hl, hl                 ; HL = (base&63)*32
   ld  a, h
   add a, d                   ; H += group offset (total <$4000, no carry out)
+  add a, $80                 ; H += $8000 (slot-2 base); H<$40 so no carry
   ld  h, a
-  ld  de, $8000
-  add hl, de
   ld  (BGV_SRC), hl
 .else
   ld   l, c
