@@ -1421,6 +1421,42 @@ _ppu_r_ppudata:
   cp   $20
   jp   nc, _ppu_r_ppudata_non_chr
 
+.ifdef NES_MMC3
+  ; MMC3: raw CHR byte from the R0-R5-selected 1 KiB bank. slot = addr>>10,
+  ; sub = addr & $3FF; map bank NES_MMC3_CHR_NES_BASE + (chr1k>>4) into
+  ; slot 2, read at $8000 + ((chr1k&15)<<10 | sub), then restore slot 2.
+  ld   a, ($cb0f)
+  srl  a
+  srl  a                     ; A = slot (addr>>10, 0-7)
+  push bc                    ; preserve C (buffered return value) across helper
+  call rt_mmc3_chr_1k        ; A = chr1k (masked); clobbers AF/BC/DE/HL
+  pop  bc                    ; C = buffered return value again
+  ld   b, a                  ; B = chr1k
+  srl  a
+  srl  a
+  srl  a
+  srl  a                     ; A = chr1k >> 4 (raw CHR SMS bank index)
+  add  a, NES_MMC3_CHR_NES_BASE
+  ld   ($ffff), a            ; raw CHR bank into slot 2
+  ld   a, b
+  and  $0f                   ; A = chr1k & 15
+  add  a, a
+  add  a, a                  ; A = (chr1k & 15) << 2
+  ld   b, a
+  ld   a, ($cb0f)
+  and  $03                   ; A = sub >> 8 (bits 8-9 of PPU address)
+  add  a, b
+  add  a, $80
+  ld   h, a                  ; H = $80 + ((chr1k&15)<<2) + (addr>>8 & 3)
+  ld   a, ($cb10)
+  ld   l, a                  ; L = addr & $FF
+  ld   a, (hl)               ; raw CHR byte for the selected 1 KiB bank
+  ld   ($cb11), a
+  call rt_restore_prg_window   ; current NES PRG window (banked-aware)
+  call _ppu_r_inc_addr
+  ld   a, c
+  jp   _ppu_r_done
+.else
   ; Map raw NES CHR into slot 2, read $8000 + PPUADDR, then restore slot 2 to
   ; the lower PRG data window expected by translated table reads.
   ld   a, :data_chr_nes
@@ -1436,6 +1472,7 @@ _ppu_r_ppudata:
   call _ppu_r_inc_addr
   ld   a, c
   jp   _ppu_r_done
+.endif
 
 _ppu_r_ppudata_non_chr:
   ; Name-table/palette readback is not needed for SMB's current boot path.

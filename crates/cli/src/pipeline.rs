@@ -2444,18 +2444,14 @@ pub fn run(args: &Args) -> Result<String, Error> {
     // Preserve raw NES CHR bytes for emulated PPUDATA reads. SMB's
     // DrawTitleScreen copies a command stream from PPU pattern-table space
     // ($1EC0+) through $2007; the converted SMS 4bpp tiles are not suitable
-    // for that CPU-visible readback path. MMC3 ships the power-on set
-    // (first 8 KiB): correct until the first CHR switch; a shadow-aware
-    // pattern reader is follow-up work (traced via tile PPM diffs).
-    let chr_nes = if mmc3 {
-        Some(image.chr[..image.chr.len().min(8192)].to_vec())
+    // for that CPU-visible readback path. MMC3 ships the FULL CHR image so
+    // the banked pattern reader (_ppu_r_ppudata) can resolve the R0-R5 1 KiB
+    // CHR bank and return the same byte the reference bus would.
+    let chr_nes = Some(if image.chr.is_empty() {
+        vec![0u8; 8192]
     } else {
-        Some(if image.chr.is_empty() {
-            vec![0u8; 8192]
-        } else {
-            image.chr.to_vec()
-        })
-    };
+        image.chr.to_vec()
+    });
 
     let project_assets = ProjectAssets {
         chr_4bpp,
@@ -2506,10 +2502,18 @@ pub fn run(args: &Args) -> Result<String, Error> {
         // 512 KiB for everything: NROM translated uses banks 4-23;
         // banked carts use translated 4-16 + PRG data 17-24 + assets
         // 25-31 (1 MiB ROMs rendered black on real emulators).
-        // MMC3 needs 1 MiB (translated 4-20, PRG pairs 21-36, CHR groups
-        // 37-52, assets 53+): trace_sms verifies it; real-emulator 1 MiB
-        // support is a known follow-up.
-        rom_kib: if mmc3 { 1024 } else { 512 },
+        // MMC3 base 1 MiB holds translated 4-20, PRG pairs 21-36, CHR
+        // groups 37-52, and the 8 packed asset banks 53-60. The full raw
+        // CHR for the banked $2007 pattern reader needs ceil(chr/16KiB)
+        // banks at 61+; the base image already leaves 3 spare banks
+        // (61-63). trace_sms verifies it; real-emulator 1 MiB support is a
+        // known follow-up.
+        rom_kib: if mmc3 {
+            let chr_banks = image.chr.len().div_ceil(0x4000);
+            1024 + (chr_banks.saturating_sub(3) * 16) as u32
+        } else {
+            512
+        },
         region: 0x4C,
         title: truncate_title(&prof.rom.name),
         mirroring,

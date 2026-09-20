@@ -371,6 +371,15 @@ fn validate_config(
                 required_bank = required_bank.max(asset_base + offset);
             }
         }
+        // MMC3 also ships the FULL raw CHR image (banked $2007 pattern
+        // reads) as ceil(len/16KiB) banks starting just above the packed
+        // asset banks (asset_base + 8).
+        if assets.mmc3_prg_pairs.is_some() {
+            if let Some(chr_nes) = &assets.chr_nes {
+                let chr_banks = chr_nes.len().div_ceil(0x4000) as u32;
+                required_bank = required_bank.max(asset_base + 8 + chr_banks.saturating_sub(1));
+            }
+        }
     }
     let bank_count = cfg.rom_kib / 16;
     if required_bank >= bank_count {
@@ -581,6 +590,14 @@ fn sms_asm_content(
             "\n.define NES_MMC3_CHR_BASE {MMC3_CHR_BASE}\n.define NES_MMC3_CHR_COUNT {chr_1k}\n.define NES_MMC3_CHR_MASK {}",
             chr_1k - 1
         ));
+        // Raw (2bpp) CHR image for the banked $2007 pattern reader lives at
+        // asset_base + 8, in 16 KiB banks holding 16 1 KiB CHR banks each.
+        // The runtime resolves R0-R5 -> chr1k -> bank (chr1k>>4) + offset
+        // ((chr1k&15)<<10 | addr&$3FF).
+        mapper_define.push_str(&format!(
+            "\n.define NES_MMC3_CHR_NES_BASE {}",
+            asset_base + 8
+        ));
     }
 
     if !assets.wram_blobs.is_empty() {
@@ -777,21 +794,41 @@ fn sms_asm_content(
     }
 
     if assets.chr_nes.is_some() {
-        let banked = assets.prg_banks.is_some() || assets.mmc3_prg_pairs.is_some();
-        let (bank, org) = if banked {
-            (asset_base + 1, PACKED_CHR_NES_OFFSET)
+        if assets.mmc3_prg_pairs.is_some() {
+            // MMC3: full raw CHR in 16 KiB banks above the packed assets for
+            // the banked $2007 pattern reader. Bank i holds CHR 1 KiB banks
+            // 16i..16i+15 (see NES_MMC3_CHR_NES_BASE in mapper_define).
+            let chr_nes = assets.chr_nes.as_ref().expect("checked is_some");
+            let chr_banks = chr_nes.len().div_ceil(0x4000);
+            let base = asset_base + 8;
+            for (i, _) in (0..chr_banks).enumerate() {
+                let bank = base + i as u32;
+                out.push_str(&format!(
+                    "\n.bank {bank} slot 2\n\
+                     .org $0000\n\
+                     .section \"data_chr_nes_{i}\" force\n\
+                     data_chr_nes_{i}:\n\
+                     .incbin \"data/chr_nes_{i}.bin\"\n\
+                     .ends\n"
+                ));
+            }
         } else {
-            (asset_base + 4, 0)
-        };
-        out.push_str(&format!(
-            "\n\
-             .bank {bank} slot 2\n\
-             .org ${org:04X}\n\
-             .section \"data_chr_nes\" force\n\
-             data_chr_nes:\n\
-             .incbin \"data/chr.nes\"\n\
-             .ends\n"
-        ));
+            let banked = assets.prg_banks.is_some();
+            let (bank, org) = if banked {
+                (asset_base + 1, PACKED_CHR_NES_OFFSET)
+            } else {
+                (asset_base + 4, 0)
+            };
+            out.push_str(&format!(
+                "\n\
+                 .bank {bank} slot 2\n\
+                 .org ${org:04X}\n\
+                 .section \"data_chr_nes\" force\n\
+                 data_chr_nes:\n\
+                 .incbin \"data/chr.nes\"\n\
+                 .ends\n"
+            ));
+        }
     }
 
     if assets.chr_maps.is_some() {
@@ -880,6 +917,13 @@ fn emit_data_files(
     }
     if let Some(chr_nes) = &assets.chr_nes {
         fs::write(data_dir.join("chr.nes"), chr_nes)?;
+        // MMC3: split the full raw CHR into 16 KiB banks for the banked
+        // $2007 pattern reader (one .incbin per SMS bank).
+        if assets.mmc3_prg_pairs.is_some() {
+            for (i, chunk) in chr_nes.chunks(0x4000).enumerate() {
+                fs::write(data_dir.join(format!("chr_nes_{i}.bin")), chunk)?;
+            }
+        }
     }
     if let Some(chr_maps) = &assets.chr_maps {
         fs::write(data_dir.join("chr_maps.bin"), chr_maps)?;
