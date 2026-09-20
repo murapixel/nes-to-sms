@@ -37,6 +37,17 @@ pub struct ProjectAssets {
     pub chr_nes: Option<Vec<u8>>,
     /// Optional 0x600-byte CHR remap data for runtime tile lookup.
     pub chr_maps: Option<Vec<u8>>,
+    /// Static WRAM code blobs (mapper 4 `[[wram_blob]]`) to seed into SMS
+    /// EXRAM at boot so translated WRAM code and PRG data reads observe the
+    /// same bytes the game would have copied from CHR ROM itself.
+    pub wram_blobs: Vec<WramBlobAsset>,
+}
+
+/// One static WRAM blob: its WRAM destination and the raw blob bytes.
+#[derive(Debug, Clone)]
+pub struct WramBlobAsset {
+    pub dest: u16,
+    pub bytes: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -354,6 +365,7 @@ fn validate_config(
             (assets.chr_nes.is_some(), 4),
             (assets.chr_maps.is_some(), 5),
             (assets.prg_high.is_some(), 6),
+            (!assets.wram_blobs.is_empty(), 7),
         ] {
             if enabled {
                 required_bank = required_bank.max(asset_base + offset);
@@ -568,6 +580,18 @@ fn sms_asm_content(
         mapper_define.push_str(&format!(
             "\n.define NES_MMC3_CHR_BASE {MMC3_CHR_BASE}\n.define NES_MMC3_CHR_COUNT {chr_1k}\n.define NES_MMC3_CHR_MASK {}",
             chr_1k - 1
+        ));
+    }
+
+    if !assets.wram_blobs.is_empty() {
+        // Static WRAM code blobs (mapper 4): the runtime seed (rt_wram_blob_seed)
+        // and the boot call site are both gated behind `.ifdef WRAM_BLOB_COUNT`,
+        // so these defines must precede the runtime includes, not the data
+        // section (where the bank image itself is emitted).
+        mapper_define.push_str(&format!(
+            "\n.define WRAM_BLOB_COUNT {}\n.define WRAM_BLOB_BANK {}",
+            assets.wram_blobs.len(),
+            asset_base + 7
         ));
     }
     let mirroring_define = match cfg.mirroring {
@@ -796,6 +820,22 @@ fn sms_asm_content(
         ));
     }
 
+    if !assets.wram_blobs.is_empty() {
+        let wram_bank = asset_base + 7;
+        out.push_str(&format!(
+            "\n\
+             .bank {wram_bank} slot 2\n\
+             .org $0000\n\
+             .section \"data_wram_blobs\" force\n\
+             data_wram_blob_table:\n\
+             .incbin \"data/wram_blob_table.bin\"\n\
+             .dw $0000\n\
+             data_wram_blob_data:\n\
+             .incbin \"data/wram_blobs.bin\"\n\
+             .ends\n"
+        ));
+    }
+
     out
 }
 
@@ -843,6 +883,17 @@ fn emit_data_files(
     }
     if let Some(chr_maps) = &assets.chr_maps {
         fs::write(data_dir.join("chr_maps.bin"), chr_maps)?;
+    }
+    if !assets.wram_blobs.is_empty() {
+        let mut bytes = Vec::new();
+        let mut table = Vec::new();
+        for blob in &assets.wram_blobs {
+            table.extend_from_slice(&blob.dest.to_le_bytes());
+            table.extend_from_slice(&(blob.bytes.len() as u16).to_le_bytes());
+            bytes.extend_from_slice(&blob.bytes);
+        }
+        fs::write(data_dir.join("wram_blobs.bin"), &bytes)?;
+        fs::write(data_dir.join("wram_blob_table.bin"), &table)?;
     }
 
     Ok(())
@@ -942,6 +993,7 @@ mod tests {
             mmc3_chr_groups: None,
             chr_nes: None,
             chr_maps: None,
+            wram_blobs: Vec::new(),
         }
     }
 
@@ -1105,6 +1157,7 @@ mod tests {
             mmc3_chr_groups: None,
             chr_nes: None,
             chr_maps: None,
+            wram_blobs: Vec::new(),
         };
 
         emit_assets_only(&out, &build, &assets).unwrap();
@@ -1373,6 +1426,39 @@ mod tests {
         assert!(!sms_asm.contains(".define NES_MIRRORING_HORIZONTAL 1"));
 
         fs::remove_dir_all(&out).unwrap();
+    }
+
+    #[test]
+    fn test_wram_blob_defines_precede_runtime_includes() {
+        // rt_wram_blob_seed (mapper_mmc3.s) and its boot call site (boot.s)
+        // are both gated behind `.ifdef WRAM_BLOB_COUNT`, so the define must
+        // be emitted BEFORE the runtime `.include`s. Emitting it in the data
+        // section (after the includes) makes the seed silently dead code.
+        let mut cfg = minimal_cfg();
+        cfg.mapper = 4;
+        cfg.mmc3_prg_half_count = Some(8);
+        cfg.mmc3_chr_count = Some(8);
+        let mut assets = minimal_assets();
+        assets.wram_blobs = vec![WramBlobAsset {
+            dest: 0x6000,
+            bytes: vec![0xA8, 0xF0, 0x02],
+        }];
+
+        let runtime_s_files = vec![PathBuf::from("boot.s"), PathBuf::from("mapper_mmc3.s")];
+        let sms_asm = sms_asm_content(&cfg, &assets, false, &runtime_s_files);
+
+        let define_pos = sms_asm
+            .find(".define WRAM_BLOB_COUNT")
+            .expect("WRAM_BLOB_COUNT define present");
+        let boot_include_pos = sms_asm
+            .find(".include \"runtime/boot.s\"")
+            .expect("boot.s include present");
+        assert!(
+            define_pos < boot_include_pos,
+            "WRAM_BLOB_COUNT define must precede the runtime includes so the seed assembles"
+        );
+        // The bank image is still emitted for the runtime to copy from.
+        assert!(sms_asm.contains("data_wram_blobs"));
     }
 
     #[test]

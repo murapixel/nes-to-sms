@@ -482,6 +482,68 @@ _sram_bad:
 _sram_ok:
   ret
 
+; ─── rt_wram_blob_seed ────────────────────────────────────────────────
+; Boot reset DI only. Copies the baked [[wram_blob]] bytes from ROM into
+; SMS EXRAM ($6000-$7FFF over slot-2 $8000-$9FFF). Mother copies the same
+; STATIC bytes from CHR at the title->game transition via IRQ-driven PPU
+; reads; baking them here removes the dependency on that CHR live-read path
+; so translated WRAM code and PRG data reads observe the right bytes.
+; The source data lives in slot-2 bank WRAM_BLOB_BANK (ROM); EXRAM shares
+; slot 2, so each byte toggles $FFFC between the ROM image and EXRAM.
+; Clobbers AF/BC/DE/HL. No IX/IY (z80_emu fails closed on DD/FD prefixes).
+; $D300-$D303 are boot-time scratch (translated return-stack slot + the
+; dirty-metadata reserve); the game re-initializes them after reset.
+.ifdef WRAM_BLOB_COUNT
+rt_wram_blob_seed:
+  ld   a, WRAM_BLOB_BANK
+  ld   ($ffff), a            ; blob data bank into slot 2 (ROM)
+  xor  a
+  ld   ($fffc), a            ; EXRAM off -> ROM visible in slot 2
+  ld   a, WRAM_BLOB_COUNT
+  ld   ($d301), a            ; remaining blob count
+  ld   hl, data_wram_blob_table
+  ld   ($d302), hl           ; table cursor (2-byte shadow)
+  ld   hl, data_wram_blob_data
+_seed_blob_next:
+  push hl                    ; save the monotonic data cursor
+  ld   hl, ($d302)           ; HL = table cursor
+  ld   e, (hl)               ; E = dest low
+  inc  hl
+  ld   d, (hl)               ; D = dest high
+  inc  hl
+  ld   c, (hl)               ; C = length low
+  inc  hl
+  ld   b, (hl)               ; B = length high
+  inc  hl
+  ld   ($d302), hl           ; save advanced table cursor
+  ld   a, d
+  add  a, $20                ; NES $6000-$7FFF -> slot-2 $8000-$9FFF
+  ld   d, a                  ; DE = EXRAM address
+  pop  hl                    ; restore the data cursor
+_seed_blob_byte:
+  ld   a, (hl)               ; ROM byte (EXRAM off)
+  ld   ($d300), a            ; park the byte while A loads the control
+  ld   a, $08
+  ld   ($fffc), a            ; EXRAM on
+  ld   a, ($d300)
+  ld   (de), a               ; write to EXRAM
+  xor  a
+  ld   ($fffc), a            ; EXRAM off
+  inc  hl
+  inc  de
+  dec  bc
+  ld   a, b
+  or   c
+  jr   nz, _seed_blob_byte
+  ld   a, ($d301)
+  dec  a
+  ld   ($d301), a
+  jr   nz, _seed_blob_next
+  xor  a
+  ld   ($fffc), a
+  ret
+.endif
+
 ; ─── rt_mmc3_chr_sync ─────────────────────────────────────────────────
 ; NMI-presentation hook: the visible tile set changed (CHR bank writes via
 ; MMC3_CHR_DIRTY, or a PPUCTRL BG-table switch vs the $CA13 presented-table

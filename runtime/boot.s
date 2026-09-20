@@ -443,6 +443,10 @@ boot_main:
   ; 0, HIGH = half 1, IRQ off). Translated reset code assumes the reference
   ; power-on mapping from the first instruction.
   call rt_mmc3_reset
+.ifdef WRAM_BLOB_COUNT
+  ; Seed static WRAM code blobs into SMS EXRAM (mapper_mmc3.s).
+  call rt_wram_blob_seed
+.endif
 .endif
   ld  hl, $dd80             ; ring-slot NT refcounts (chrmap.s BGV_REFCNT)
   ld  bc, $00c0             ; 192 entries for slots 64-255

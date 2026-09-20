@@ -2468,6 +2468,21 @@ pub fn run(args: &Args) -> Result<String, Error> {
         prg_high,
         chr_nes,
         chr_maps: Some(chr_maps),
+        wram_blobs: if mmc3 {
+            prof.wram_blobs
+                .iter()
+                .map(|blob| {
+                    let len = usize::from(blob.length);
+                    let src = usize::try_from(blob.source).unwrap_or(0);
+                    sms_project::WramBlobAsset {
+                        dest: blob.dest,
+                        bytes: image.chr.get(src..src + len).unwrap_or_default().to_vec(),
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        },
     };
 
     // 9. Emit the WLA-DX project.
