@@ -1,0 +1,27 @@
+# Mother lockstep attempt: a+b held 310-342 (32 frames) fires subject START
+# via the INPUT_PAUSE_START 30-frame chord injector; reference (FD_PAD_BOTH)
+# sees B+START from bit5 during the hold. Then A-taps for menu/dialogue.
+310:a,b
+342:
+400:a
+410:
+500:a
+510:
+600:a
+610:
+700:a
+710:
+800:a
+810:
+900:a
+910:
+1000:a
+1010:
+1100:a
+1110:
+1200:a
+1210:
+1300:a
+1310:
+1400:a
+1410:
