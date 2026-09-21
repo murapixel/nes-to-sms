@@ -923,3 +923,55 @@ addr = 0xa064
 [[bank_entry]]
 bank = 19
 addr = 0xbbf5
+
+# Coverage batch 2026-09-21 (walk2 harvest): NPC-dialogue/text engine,
+# bank-19 HIGH. Harvest: FD_LOG_BANK_ENTRIES=1 frame-diff --ref-only,
+# FD_PAD_RAW=/tmp/toolchain/probe/walk2.txt, 67000 frames, rc=0 -> 101
+# unique MMC3_ENTRY (83 prior + 18 new, 12 already seeded, 6 below).
+# Bank+frame proof: FD_TRACE_PC=A8BF,A8E3,A91A,A928,A941,B078,963D,9786,
+# 97B0,A3F8,A92F,AB09,BC73,BCAA + FD_TRACE_PC_LIMIT=2000 -> all six hit
+# with bank=19, first at frames 29005 ($A91A/$A928) and 37000
+# ($A8E3/$A91A/$A941/$B078/$A8BF), re-hit 61005; PPMs at f29000/f37000
+# are NPC-dialogue screens. Byte spot checks at fileoff = 16 + 19*8192 +
+# (addr-$A000). Static scan: every JSR/JMP caller of all six lives in
+# bank-19 HIGH-window sites -> intra-bank family, no [[bank_call]] needed
+# (overworld-batch precedent). $A91A falls through into $A928 —
+# overlapping entry labels, same class as $8C6B/$8C6E.
+
+# walk2 harvest + TRACE_PC bank=19 frame=37000 + bytes b19 $A8BF=20 1F A4
+# 20 E6 AA (JSR $A41F; JSR $AAE6-seeded; JMP $C4F6-fixed).
+[[bank_entry]]
+bank = 19
+addr = 0xa8bf
+
+# walk2 harvest + TRACE_PC bank=19 frame=37000 + bytes b19 $A8E3=20 6F FE
+# 20 1A A9 (JSR $FE6F; JSR $A91A-sibling; prev 86 2B 60 clean RTS boundary).
+[[bank_entry]]
+bank = 19
+addr = 0xa8e3
+
+# walk2 harvest + TRACE_PC bank=19 frame=29005 + bytes b19 $A91A=A5 28 20
+# 50 C8 A5 60 85 40 (LDA $28; JSR $C850; falls through to $A928; prev
+# 4C 75 FE clean).
+[[bank_entry]]
+bank = 19
+addr = 0xa91a
+
+# walk2 harvest + TRACE_PC bank=19 frame=29005 + bytes b19 $A928=A0 01 B1
+# 40 29 F0 60 (LDY #1; LDA ($40),Y text fetch; AND #F0; RTS; prev 85 41
+# 60 clean).
+[[bank_entry]]
+bank = 19
+addr = 0xa928
+
+# walk2 harvest + TRACE_PC bank=19 frame=37000 + bytes b19 $A941=20 78 B0
+# D0 11 (JSR $B078-sibling; BNE; prev 4C 75 FE clean).
+[[bank_entry]]
+bank = 19
+addr = 0xa941
+
+# walk2 harvest + TRACE_PC bank=19 frame=37000 + bytes b19 $B078=20 C6 BC
+# A0 02 B1 60 (JSR $BCC6-seeded; LDY #2; LDA ($60),Y; prev 86 61 60 clean).
+[[bank_entry]]
+bank = 19
+addr = 0xb078
