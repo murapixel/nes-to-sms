@@ -1,7 +1,7 @@
 ---
 description: MMC3 orchestrator — routes coverage vs debug, owns handoffs and gates. Use for Mother playable push, trap triage routing, seed application.
 mode: primary
-model: opencode-go/deepseek-v4-flash
+model: opencode/muse-spark-1.3-contributor-free
 temperature: 0.2
 steps: 80
 permission:
