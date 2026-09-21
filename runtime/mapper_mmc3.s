@@ -544,6 +544,71 @@ _seed_blob_byte:
   ret
 .endif
 
+; ─── rt_mmc3_chr_1k ───────────────────────────────────────────────────
+; Entry: A = pattern-table 1 KiB slot (0-7). Exit: A = the CHR 1 KiB bank
+; index selected through the R0-R5 windows and the CHR-invert bit, masked
+; by NES_MMC3_CHR_MASK. Mirrors nes_rom::Mmc3State::chr_bank_1k — this is
+; the single Z80 source of truth; keep the two in lock-step. Clobbers
+; AF, BC, DE, HL.
+rt_mmc3_chr_1k:
+  ld   b, a                    ; B = slot (0-7)
+  ld   a, (MMC3_BANK_SELECT)
+  bit  7, a
+  jr   nz, _mck_inv
+  ; Non-invert: slots 0-3 -> R0/R1 pairs, slots 4-7 -> R2-R5 direct.
+  ld   a, b
+  cp   4
+  jr   c, _mck_pair01
+  sub  2                       ; A = reg index 2-5
+  jr   _mck_direct
+_mck_pair01:
+  srl  a                       ; A = pair idx (slot>>1)
+  ld   d, a
+  ld   a, b
+  and  $01
+  ld   c, a                    ; C = off (slot&1)
+  ld   a, d
+  jr   _mck_pair
+_mck_inv:
+  ; Invert: slots 0-3 -> R2-R5 direct, slots 4-7 -> R0/R1 pairs.
+  ld   a, b
+  cp   4
+  jr   nc, _mck_inv_pair
+  add  a, 2                    ; A = reg index 2-5
+  jr   _mck_direct
+_mck_inv_pair:
+  sub  4                       ; A = slot-4 (0-3)
+  ld   c, a
+  srl  a                       ; A = (slot-4)>>1
+  ld   d, a
+  ld   a, c
+  and  $01
+  ld   c, a                    ; C = off
+  ld   a, d
+_mck_pair:
+  ; A = pair idx (0/1), C bit0 = off. chr1k = (R[idx] & ~1) | off.
+  ld   hl, MMC3_R0
+  ld   d, $00
+  ld   e, a
+  add  hl, de
+  ld   a, (hl)
+  and  $fe
+  ld   b, a
+  ld   a, c
+  and  $01
+  or   b                       ; A = chr1k
+  jr   _mck_have
+_mck_direct:
+  ; A = reg index (0-7). chr1k = R[A].
+  ld   hl, MMC3_R0
+  ld   d, $00
+  ld   e, a
+  add  hl, de
+  ld   a, (hl)                 ; A = chr1k (raw)
+_mck_have:
+  and  NES_MMC3_CHR_MASK
+  ret
+
 ; ─── rt_mmc3_chr_sync ─────────────────────────────────────────────────
 ; NMI-presentation hook: the visible tile set changed (CHR bank writes via
 ; MMC3_CHR_DIRTY, or a PPUCTRL BG-table switch vs the $CA13 presented-table

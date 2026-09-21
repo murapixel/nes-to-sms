@@ -86,11 +86,11 @@ _gv_p3_zero:
   ; source = data_chr ($8000) + base*32
 .ifdef NES_MMC3
   ; MMC3: the visible tile set is bank-switched, so the source is per-bank
-  ; ROM data, not data_chr. 1 KiB slot = table*4 + base/64; chr1k from R0-R5
-  ; + CHR-invert (mirrors nes_rom::Mmc3State::chr_bank_1k — keep in
-  ; lock-step); SMS bank = NES_MMC3_CHR_BASE + (chr1k>>3); bank offset =
-  ; ((chr1k&7)<<11) + ((base&63)<<5). Parks the bank in E (dead until the
-  ; map below; the dest programming between touches only A/H/L).
+  ; ROM data, not data_chr. 1 KiB slot = table*4 + base/64; chr1k resolves
+  ; through rt_mmc3_chr_1k (R0-R5 + CHR-invert); SMS bank =
+  ; NES_MMC3_CHR_BASE + (chr1k>>3); bank offset = ((chr1k&7)<<11) +
+  ; ((base&63)<<5). Parks the bank in E (dead until the map below; the dest
+  ; programming between touches only A/H/L).
   push bc                    ; park base (C); B=S is dead past BGV_P2/P3
   ld  a, c
   rlca
@@ -109,61 +109,8 @@ _gv_mmc3_table:
   rrca                       ; $10 -> $04
   or  e
   ld  b, a                   ; B = slot_1k (0-7)
-  ld  a, (MMC3_BANK_SELECT)
-  bit 7, a
-  jr  nz, _gv_mmc3_inv
-  ; Non-invert: slots 0-3 -> R0/R1 pairs, slots 4-7 -> R2-R5 direct.
-  ld  a, b
-  cp  4
-  jr  c, _gv_mmc3_pair01
-  sub 2                      ; A = reg index 2-5
-  jr  _gv_mmc3_direct
-_gv_mmc3_pair01:
-  srl a                      ; A = pair idx (slot>>1)
-  ld  d, a
-  ld  a, b
-  and $01
-  ld  c, a                   ; C = off (slot&1)
-  ld  a, d
-  jr  _gv_mmc3_pair
-_gv_mmc3_inv:
-  ; Invert: slots 0-3 -> R2-R5 direct, slots 4-7 -> R0/R1 pairs.
-  ld  a, b
-  cp  4
-  jr  nc, _gv_mmc3_inv_pair
-  add a, 2                   ; A = reg index 2-5
-  jr  _gv_mmc3_direct
-_gv_mmc3_inv_pair:
-  sub 4                      ; A = slot-4 (0-3)
-  ld  c, a
-  srl a                      ; idx = (slot-4)>>1
-  ld  d, a
-  ld  a, c
-  and $01
-  ld  c, a                   ; C = off
-  ld  a, d
-_gv_mmc3_pair:
-  ; A = pair idx (0/1), C bit0 = off. chr1k = (R[idx] & ~1) | off.
-  ld  hl, MMC3_R0
-  ld  d, $00
-  ld  e, a
-  add hl, de
-  ld  a, (hl)
-  and $fe
-  ld  b, a
-  ld  a, c
-  and $01
-  or  b                      ; A = chr1k
-  jr  _gv_mmc3_have_k
-_gv_mmc3_direct:
-  ; A = reg index (0-7). chr1k = R[A].
-  ld  hl, MMC3_R0
-  ld  d, $00
-  ld  e, a
-  add hl, de
-  ld  a, (hl)                ; A = chr1k (raw)
-_gv_mmc3_have_k:
-  and NES_MMC3_CHR_MASK
+  ld  a, b                   ; A = slot_1k
+  call rt_mmc3_chr_1k        ; A = chr1k (masked); clobbers BC/DE/HL
   ld  b, a                   ; B = chr1k (0-127)
   and $07
   add a, a
