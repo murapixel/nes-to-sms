@@ -1840,6 +1840,61 @@ fn nes_buttons_to_sms_dc(b: Buttons) -> u8 {
     !pressed // active-low
 }
 
+// ---------------------------------------------------------------------------
+// Subject pause (SMS PAUSE button) injector
+// ---------------------------------------------------------------------------
+
+/// Parse a pause-frame list (`FD_PAUSE_AT=1100` or `FD_PAUSE_AT=1100,1291`).
+/// Comma-separated subject frame numbers; whitespace is ignored. Empty
+/// elements are skipped so `"1100,,1291"` stays usable from shell scripts.
+fn parse_pause_frames(spec: &str) -> Result<Vec<usize>, String> {
+    let mut out = Vec::new();
+    for raw in spec.split(',') {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        out.push(
+            raw.parse::<usize>()
+                .map_err(|_| format!("invalid pause frame: {raw}"))?,
+        );
+    }
+    out.sort_unstable();
+    out.dedup();
+    Ok(out)
+}
+
+/// Pause schedule from the environment (`FD_PAUSE_AT`). Empty when unset;
+/// panics on malformed input so a mistyped frame can never silently run a
+/// lockstep comparison without its stimulus.
+fn pause_schedule_from_env() -> Vec<usize> {
+    std::env::var("FD_PAUSE_AT")
+        .ok()
+        .map_or_else(Vec::new, |spec| {
+            parse_pause_frames(&spec).unwrap_or_else(|err| panic!("invalid FD_PAUSE_AT: {err}"))
+        })
+}
+
+/// Inject the SMS PAUSE button NMI (Z80 NMI -> $0066), mirroring trace-sms
+/// `--pause-at-frame`. Pushes PC, moves IFF1->IFF2, clears IFF1, wakes HALT
+/// and jumps to $0066. The runtime's $0066 handler (INPUT_PAUSE_START,
+/// `runtime/boot.s`) arms the $CB2E Start countdown that
+/// `rt_controller_latch` translates into NES Start; the caller's subsequent
+/// `fire_irq` settle loop executes that handler before the frame IRQ lands,
+/// so no extra drain step is needed here. Game-agnostic: this only drives
+/// the Z80 NMI line, never NES addresses.
+fn inject_pause_nmi(cpu: &mut z80_emu::Cpu, bus: &mut SmsBus) {
+    use z80_emu::Bus;
+    cpu.sp = cpu.sp.wrapping_sub(2);
+    let pc = cpu.pc;
+    Bus::write(bus, cpu.sp, (pc & 0xFF) as u8);
+    Bus::write(bus, cpu.sp.wrapping_add(1), (pc >> 8) as u8);
+    cpu.iff2 = cpu.iff1;
+    cpu.iff1 = false;
+    cpu.halted = false;
+    cpu.pc = 0x0066;
+}
+
 // Generous per-frame budget: with the translated sound engine active a
 // heavy frame can exceed 2M instructions; truncating a frame mid-handler
 // leaves IFF disabled so every later fire_irq is silently skipped and the
@@ -2015,6 +2070,7 @@ fn run_subject(
     frames: usize,
     timeline: &ButtonTimeline,
     sym_path: Option<std::path::PathBuf>,
+    pause_at: &[usize],
 ) -> ([u8; 0x800], Vec<[u8; 0x800]>) {
     use z80_emu::{Bus, Cpu};
     let mut cpu = Cpu::new();
@@ -2251,6 +2307,16 @@ fn run_subject(
     let mut snaps: Vec<[u8; 0x800]> = Vec::with_capacity(frames);
     for _frame in 0..frames {
         bus.port_dc = timeline.sms_dc_at(_frame);
+        // SMS PAUSE stimulus (action-mode profiles: the only NES Start path).
+        // Frame numbering matches the reference loop below (both count from
+        // NMI-enable), so `--pause-at-frame 1100` lands on the same frame the
+        // reference sees Start via its own script (FD_PAD_RAW/buttons-script).
+        // Injected before fire_irq: its settle loop runs the $0066 handler
+        // (arming $CB2E) before the frame IRQ latches the controller.
+        if pause_at.contains(&_frame) {
+            inject_pause_nmi(&mut cpu, &mut bus);
+            eprintln!("PAUSE NMI injected at subject frame {_frame}");
+        }
         let dbg = Some(_frame) == debug_frame;
         if dbg {
             bus.watch = Some(watch_list.clone());
@@ -2475,6 +2541,7 @@ fn main() {
     let mut frames = 120usize;
     let mut script = "none".to_string();
     let mut buttons_script: Option<String> = None;
+    let mut pause_at_frames: Vec<usize> = Vec::new();
     let mut ref_only = false;
     let mut i = 3;
     while i < args.len() {
@@ -2490,6 +2557,14 @@ fn main() {
             "--buttons-script" => {
                 i += 1;
                 buttons_script = Some(args[i].clone());
+            }
+            "--pause-at-frame" => {
+                i += 1;
+                pause_at_frames.push(
+                    args[i]
+                        .parse::<usize>()
+                        .unwrap_or_else(|_| panic!("--pause-at-frame expects a frame number")),
+                );
             }
             "--ref-only" => ref_only = true,
             other => {
@@ -2611,6 +2686,18 @@ fn main() {
         return;
     }
 
+    // Subject pause stimulus: CLI `--pause-at-frame F` (repeatable, same
+    // spelling as trace-sms) plus `FD_PAUSE_AT=F[,G,...]`. Both feed the same
+    // Z80-NMI injector above; the reference side keeps its own stimulus
+    // (FD_PAD_RAW/buttons-script), so pair them explicitly, e.g. Start at
+    // frame 1100 on both sides for a matched-input lockstep run.
+    pause_at_frames.extend(pause_schedule_from_env());
+    pause_at_frames.sort_unstable();
+    pause_at_frames.dedup();
+    if !pause_at_frames.is_empty() {
+        eprintln!("Subject pause frames: {pause_at_frames:?}");
+    }
+
     let sms_path = _sms_path.expect("need <out.sms> for subject side");
     let rom = std::fs::read(&sms_path).expect("read sms rom");
     eprintln!(
@@ -2618,7 +2705,8 @@ fn main() {
         rom.len()
     );
     let sym_path = std::path::Path::new(&sms_path).with_extension("sym");
-    let (subj_init, subj_snaps) = run_subject(rom, frames, &timeline, Some(sym_path));
+    let (subj_init, subj_snaps) =
+        run_subject(rom, frames, &timeline, Some(sym_path), &pause_at_frames);
 
     // First, compare the init snapshot (RAM at the NMI-enable point).
     // If reset-init translation is faithful, these match and we move on
@@ -3007,5 +3095,53 @@ mod tests {
                 (100, Buttons::A | Buttons::RIGHT)
             ]
         );
+    }
+
+    #[test]
+    fn pause_frame_list_parses_sorts_and_dedups() {
+        assert_eq!(parse_pause_frames("1100").unwrap(), vec![1100]);
+        assert_eq!(
+            parse_pause_frames("1291, 1100,1100").unwrap(),
+            vec![1100, 1291]
+        );
+        assert_eq!(parse_pause_frames("  ").unwrap(), Vec::<usize>::new());
+        assert!(parse_pause_frames("1100,x").is_err());
+    }
+
+    /// The pause injector must mirror trace-sms `--pause-at-frame` exactly:
+    /// push PC, IFF1->IFF2, clear IFF1, wake HALT, land on the $0066 NMI
+    /// vector. The runtime's $0066 handler (not the harness) arms $CB2E.
+    #[test]
+    fn pause_nmi_injection_mirrors_trace_sms_semantics() {
+        use z80_emu::Bus;
+        let mut cpu = z80_emu::Cpu::new();
+        let mut bus = SmsBus::new(vec![0u8; 0x4000]);
+        cpu.pc = 0x1234;
+        cpu.sp = 0xDFF0;
+        cpu.iff1 = true;
+        cpu.iff2 = false;
+        cpu.halted = true;
+        inject_pause_nmi(&mut cpu, &mut bus);
+        assert_eq!(cpu.pc, 0x0066);
+        assert!(!cpu.iff1);
+        assert!(cpu.iff2);
+        assert!(!cpu.halted);
+        assert_eq!(cpu.sp, 0xDFEE);
+        assert_eq!(Bus::read(&mut bus, 0xDFEE), 0x34);
+        assert_eq!(Bus::read(&mut bus, 0xDFEF), 0x12);
+    }
+
+    /// NMI is non-maskable: injection works even when the CPU already has
+    /// interrupts disabled (e.g. inside the runtime's VDP DI bracket).
+    #[test]
+    fn pause_nmi_injects_with_interrupts_disabled() {
+        let mut cpu = z80_emu::Cpu::new();
+        let mut bus = SmsBus::new(vec![0u8; 0x4000]);
+        cpu.pc = 0x00AB;
+        cpu.sp = 0xDFF0;
+        cpu.iff1 = false;
+        inject_pause_nmi(&mut cpu, &mut bus);
+        assert_eq!(cpu.pc, 0x0066);
+        assert!(!cpu.iff2);
     }
 }
