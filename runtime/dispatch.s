@@ -1699,11 +1699,18 @@ rt_read_zp_ptr_y:
   cp   $20
   jr   c, _rzpy_remap_mirror
 .ifdef NES_MMC3
+  ; $6000-$7FFF is NES SRAM (SMS EXRAM): HL already holds the NES address,
+  ; so route through rt_sram_read (byte in A, preserves BC/DE/HL). A direct
+  ; dereference reads SMS ROM there (Mother frame-1204 ($60),Y bank table).
+  cp   $60
+  jr   c, _rzpy_deref
+  cp   $80
+  jr   c, _rzpy_sram
   ; $8000-$BFFF is the MMC3 switchable window: dereference through the live
   ; R6/R7 shadows (rt_mmc3_read_window preserves BC/DE/HL, byte in A).
-  cp   $80
-  jr   c, _rzpy_deref
   jp   rt_mmc3_read_window
+_rzpy_sram:
+  jp   rt_sram_read
 .endif
   jr   _rzpy_deref
 _rzpy_remap_ram:
@@ -1756,6 +1763,15 @@ _wzy_addr_ready:
   jr   c, _wzy_plain
   cp   $40
   jr   c, _wzy_ppu
+.ifdef NES_MMC3
+  ; $6000-$7FFF is NES SRAM (SMS EXRAM): HL holds the NES address, value
+  ; parked in C. Direct stores hit SMS ROM; route through rt_sram_write
+  ; (HL = addr, A = value; preserves BC/DE/HL for the epilogue below).
+  cp   $60
+  jr   c, _wzy_plain
+  cp   $80
+  jr   c, _wzy_sram
+.endif
 _wzy_plain:
   ; Remap NES RAM/mirrors to SMS RAM in HL without clobbering resident DE.
   ld   a, h
@@ -1778,6 +1794,14 @@ _wzy_store_plain:
   pop  bc
   pop  hl
   ret
+.ifdef NES_MMC3
+_wzy_sram:
+  ld   a, c                 ; restore value
+  call rt_sram_write       ; EXRAM store (preserves BC/HL for the epilogue)
+  pop  bc
+  pop  hl
+  ret
+.endif
 
 _wzy_maybe_apu:
   ld   a, l

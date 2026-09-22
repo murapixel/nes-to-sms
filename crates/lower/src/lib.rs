@@ -3212,7 +3212,7 @@ fn emit_cond_dec_loop(program: &mut z80_emit::Program, plan: &CondDecLoopPlan) {
 /// + Y, then RAM/mirror remap or a fixed-high PRG helper read. `zp = $FF`
 /// (page-wrap pair) keeps the helper. A := byte; clobbers BC/HL/flags.
 fn emit_read_zp_ptr_y_inline(p: &mut z80_emit::Program, zp: u8, mmc3_windowed: bool) {
-    use runtime_symbols::{MMC3_READ_WINDOW, READ_ZP_PTR_Y};
+    use runtime_symbols::{MMC3_READ_WINDOW, READ_ZP_PTR_Y, SRAM_READ};
     if zp == 0xFF {
         p.ld_b_imm(zp);
         p.call(READ_ZP_PTR_Y);
@@ -3245,15 +3245,25 @@ fn emit_read_zp_ptr_y_inline(p: &mut z80_emit::Program, zp: u8, mmc3_windowed: b
     p.label(&win);
     if mmc3_windowed {
         // MMC3: $8000-$BFFF is the switchable window. HL already holds the
-        // NES address and A holds H ($20-$BF here), so route $80-$BF
-        // through the live R6/R7 shadow read; $20-$7F (PPU/APU regs) is
-        // not valid pointer data and keeps the legacy direct dereference.
+        // NES address and A holds H ($20-$BF here): route $80-$BF through
+        // the live R6/R7 shadow read, and $60-$7F (NES SRAM) through the
+        // EXRAM helper — the legacy direct dereference reads SMS ROM
+        // there (Mother frame-1204: a ($60),Y bank table resolved to ROM
+        // bytes instead of EXRAM). $20-$5F (PPU/APU/IO) keeps the legacy
+        // direct dereference (residual fail-open; no profile roots a
+        // (zp),Y target there).
         let window = p.fresh_label("rzpy_window");
+        let sram = p.fresh_label("rzpy_sram");
         p.cp_imm(0x80);
         p.jr_nc(&window);
+        p.cp_imm(0x60);
+        p.jr_nc(&sram);
         p.jr(&deref);
         p.label(&window);
         p.call(MMC3_READ_WINDOW);
+        p.jr(&done);
+        p.label(&sram);
+        p.call(SRAM_READ);
         p.jr(&done);
     } else {
         p.jr(&deref);
@@ -6581,6 +6591,44 @@ chr_kib = 8
         assert!(
             build.asm.contains("call rt_mmc3_read_window"),
             "MMC3 (zp),Y window dereference must route through the shadow helper:\n{}",
+            build.asm
+        );
+    }
+
+    #[test]
+    fn mmc3_indirect_y_sram_read_routes_through_exram_helper() {
+        let prof = mmc3_test_profile();
+        let opts = LowerOptions {
+            profile: Some(&prof),
+            emit_source_comments: true,
+            routine_flag_reads: None,
+        };
+        let routine = make_routine(
+            "test_routine",
+            vec![
+                Op::LdaMem {
+                    addr: AddrExpr::IndirectY(0x60),
+                    region: MemRegion::PrgRam,
+                },
+                Op::Rts,
+            ],
+        );
+        let mut prog = z80_emit::Program::new();
+        define_runtime_stubs(&mut prog);
+        prog.org(0x0000);
+        lower_routine(&mut prog, &routine, &opts).unwrap();
+        let build = prog.finish().unwrap();
+        // (zp),Y with an effective address in $6000-$7FFF (NES SRAM) must
+        // resolve through EXRAM, not a direct slot-1 dereference (Mother
+        // frame-1204: ($60),Y bank table read ROM bytes instead of SRAM).
+        assert!(
+            build.asm.contains("call rt_sram_read"),
+            "MMC3 (zp),Y SRAM dereference must route through the EXRAM helper:\n{}",
+            build.asm
+        );
+        assert!(
+            build.asm.contains("cp $60"),
+            "SRAM arm must discriminate H >= $60:\n{}",
             build.asm
         );
     }
