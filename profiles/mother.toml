@@ -16,15 +16,25 @@ pause_start = true
 # Static WRAM code blob (see the WRAM-code blocker grounding at the
 # overworld bank-entry block, $951A JSR $6047). Mother copies 3 KiB from
 # CHR ROM offset $1E800 to WRAM $6000-$6BFF at the title->game transition
-# and executes it. 10 reference-grounded entry points (FD_TRACE_PC
-# bank=255 at frames 1105-1121, byte-identical at frames 1200/2000).
+# and executes it. 11 reference-grounded entry points (FD_TRACE_PC
+# bank=255 at frames 1105-1121, byte-identical at frames 1200/2000,
+# plus $607B at frame 1500 - see below).
 # The engine lifts these from the blob bytes; JSRs into $6000-$7FFF
 # dispatch to the translated routines.
+# $607B (11th entry): frame-1500 'A'-cascade grounding. The bank-20
+# RTS-dispatch at $943B (table $944D, X=8 from ($0584)+1=$0585=$84 ASL
+# -> $08) takes arm $9457, whose prologue does JSR $607B at $9463
+# (FD_TRACE_PC frame=1500 bank=255 pc=$607B/$6082/$6097, stack return
+# $9465). Byte-verified bounds: RTS at $607A, entry PHA at $607B, clean
+# walk to RTS at $60AC (branches at $6095/$609C/$60A3 all internal, no
+# JSR/JMP/BRK). Routine copies PRG ROM ($32)=$BE00 -> SRAM ($30)=$7400
+# (2 pages + clear) and sets $7402 flags; ref writes $31=$74->$76 and
+# $33=$BE->$C0. Without it the JSR lowers to rt_unresolved_jsr_flash.
 [[wram_blob]]
 source = 0x1E800
 dest = 0x6000
 length = 0xC00
-entries = [0x6000, 0x6047, 0x6052, 0x605D, 0x62AD, 0x62D8, 0x62ED, 0x6303, 0x631D, 0x6332]
+entries = [0x6000, 0x6047, 0x6052, 0x605D, 0x607B, 0x62AD, 0x62D8, 0x62ED, 0x6303, 0x631D, 0x6332]
 
 # Dynamically-reached fixed code (no static refs, found via dispatch-miss
 # $CB1B/$CB1C harvest): $CA89 is a JMP ($007C) transfer target (transfer
