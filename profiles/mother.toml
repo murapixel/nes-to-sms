@@ -1046,3 +1046,36 @@ bank = 19
 [[bank_call]]
 target = 0xa8c2
 bank = 19
+
+# Tap-A route batch 2026-09-22 (bank-20 RTS-dispatch arm $9457): the
+# committed state traps $E2 id=$9457 at frame 1500 on the tap-A route
+# (FD_PAD_RAW start@1100 + A-hold@1500-1530, FD_PAUSE_START=1,
+# script /tmp/toolchain/subj_tap_a.txt). The bank-20 RTS-dispatch at $943B
+# (LDY $82; LDA ($84),Y; ASL A; TAX; LDA $944E,X; PHA; LDA $944D,X; PHA;
+# TYA; LSR; LSR; RTS; table $944D words $BF61/$94A0/$9471/$948B/$9456 ->
+# +1 arms $BF62/$94A1/$9472/$948C/$9457) takes arm $9457 at X=8.
+# Provenance (own runs, this session, --ref-only 1520 frames):
+# - FD_TRACE_PC=943B,9457,9472,948C,94A1,BF62,606A,607B LIMIT=5000:
+#   frame=1500 bank=20 pc=$943B (X=$00 Y=$0B) -> pc=$9457 (X=$08, bank=20)
+#   -> pc=$607B (bank=255 WRAM blob, seeded fac7334). Log:
+#   /tmp/toolchain/trace_tapa_arms.log.
+# - MMC3_ENTRY harvest (FD_LOG_BANK_ENTRIES=1, same route/frames, 52 unique
+#   entries, /tmp/toolchain/harv_tapa1520.log) is structurally blind to this
+#   arm: frame_diff.rs only logs JSR/JMP-absolute targets and JMP-(indirect)
+#   landings in $8000-$BFFF, never pushed-address RTS targets — hence no
+#   MMC3_ENTRY for ANY of the 5 arms. TRACE_PC is the grounding instrument
+#   ($CA19-arm precedent: fixed-bank arms rooted as [[function]] on TRACE_PC
+#   evidence, never as entries).
+# - Byte spot-check at LOW offset (fileoff = 16 + 20*8192 + (addr-$8000)):
+#   $9457 = 48 (PHA); JSR $FE6F; LDA #$1D; LDX #$07; JSR $FFD0; PLA;
+#   JSR $607B at $9463; JSR $FE75; JSR $CFB3; JSR $9AF6; JMP $BF31 at $946F
+#   (27 bytes, abuts the $9472 arm boundary); table bytes $944D-$9456 match
+#   the 5 arms (+1 each).
+# Sibling arms $94A1/$9472/$948C and blob $606A were on the TRACE_PC watch
+# list and logged ZERO hits through frame 1520, and are absent from the
+# MMC3_ENTRY set: not reference-observed on this route -> deliberately NOT
+# seeded (no invention). $BF62 (the X=0 arm, bank 19) was TRACE_PC-observed
+# at frames 1209/1213/1217 and is already seeded.
+[[bank_entry]]
+bank = 20
+addr = 0x9457
