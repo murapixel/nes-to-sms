@@ -995,3 +995,44 @@ addr = 0xa941
 [[bank_entry]]
 bank = 19
 addr = 0xb078
+
+# Coverage batch 2026-09-22 (walk4d harvest): overworld route, bank-19.
+# Harvest: FD_LOG_BANK_ENTRIES=1 frame-diff --ref-only, 248000 frames,
+# FD_PAD_RAW=/tmp/toolchain/probe/walk4.txt, EXIT=0, overworld f150k-248k
+# (PPM-proven: ctrl=$88/$89, scrollx=$68/$98, overworld palette). 108
+# unique MMC3_ENTRY vs 127 profile seeds -> 2 new unseeded entries below.
+# Both also present in the earlier 48recon harvest (independent
+# re-observation). Byte spot-checks at HIGH offset (addr-$A000), bank 19
+# = fileoff 19*0x2000+addr-$A000. The 8 primary targets ($963D $9786
+# $97B0 $A3F8 $A92F $AB09 $BC73 $BCAA) did NOT execute in walk4d either —
+# still unseeded, no invention.
+
+# Walk4d harvest: MMC3_ENTRY bank8=19 addr=0xa396. RTS-dispatch trampoline
+# head (LDY #$04; LDA ($60),Y; ASL A; TAX; LDA $A3A6,X; PHA; LDA $A3A5,X;
+# PHA; RTS) byte-verified at HIGH offset in bank 19. Static JSR callers in
+# bank-19 LOW at $8247/$82C8/$8372 (each paired with JMP $A8C2 below).
+[[bank_entry]]
+bank = 19
+addr = 0xa396
+
+# Walk4d harvest: MMC3_ENTRY bank8=19 addr=0xa8c2. JSR $AAE6 (seeded);
+# JMP $C4F6 (fixed ProfileRoot) byte-verified at HIGH offset in bank 19.
+# Static JMP callers in bank-19 LOW at $824A/$82CB/$82D6/$82FA/$8375.
+[[bank_entry]]
+bank = 19
+addr = 0xa8c2
+
+# Same-bank cross-window edge (LOW->HIGH, precedent: 0xabf6 for
+# $L_b19_8D54): three static JSR $A396 in bank-19 LOW
+# ($8247/$82C8/$8372), all live in the walk4d-harvested code region next
+# to seeded $A8BF/$A91A/$B8AC/$A41F calls.
+[[bank_call]]
+target = 0xa396
+bank = 19
+
+# Same-bank cross-window edge: five static JMP $A8C2 in bank-19 LOW
+# ($824A/$82CB/$82D6/$82FA/$8375), each the fall-through partner of a
+# JSR $A396 above ($8247->$824A, $82C8->$82CB, $8372->$8375).
+[[bank_call]]
+target = 0xa8c2
+bank = 19
