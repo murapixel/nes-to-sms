@@ -84,6 +84,20 @@ impl From<sms_project::EmitError> for Error {
 /// Mapper-store violations cannot safely degrade to generated stubs: doing so
 /// could turn an unsupported store into a wrong bank switch. Other lowering
 /// errors remain diagnostics while the converter's broader coverage grows.
+/// Raw-CIRAM shadow backend selection. Cartridge SRAM (iNES battery bit)
+/// owns slot-2 SMS EXRAM as the $6000-$7FFF WRAM mirror, which fully
+/// overlaps the 2 KiB EXRAM raw-CIRAM shadow ($8000-$87FF); keeping the
+/// shadow there would corrupt WRAM code/data on every nametable write
+/// (frame-1213 Mother $0074/$0075 divergence via clobbered $60B3/$60B4),
+/// so SRAM carts run without the EXRAM shadow (projection repaints).
+fn raw_ciram_backend_for(has_battery: bool) -> RawCiramBackend {
+    if has_battery {
+        RawCiramBackend::None
+    } else {
+        RawCiramBackend::SramSlot2
+    }
+}
+
 fn lower_error_is_fatal(error: &lower::LowerError) -> bool {
     matches!(error, lower::LowerError::UnsupportedMapperStore { .. })
 }
@@ -2517,7 +2531,7 @@ pub fn run(args: &Args) -> Result<String, Error> {
         region: 0x4C,
         title: truncate_title(&prof.rom.name),
         mirroring,
-        raw_ciram_backend: RawCiramBackend::SramSlot2,
+        raw_ciram_backend: raw_ciram_backend_for(image.header.has_battery),
         mapper: prof.rom.mapper,
         uxrom_bank_count: (policy.is_banked() && !mmc3).then_some(policy.bank_count()),
         uxrom_bus_conflicts: (!mmc3)
@@ -3239,6 +3253,12 @@ const RUNTIME_SYMBOLS: &[&str] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sram_carts_disable_exram_raw_ciram_backend() {
+        assert_eq!(raw_ciram_backend_for(true), RawCiramBackend::None);
+        assert_eq!(raw_ciram_backend_for(false), RawCiramBackend::SramSlot2);
+    }
 
     #[test]
     fn parses_profile_jump_target_physical_identity() {

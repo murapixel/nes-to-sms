@@ -175,6 +175,18 @@ rt_raw_ciram_sram_read_locked:
   ld   a, c
   ret
 
+.else
+; No EXRAM raw-CIRAM backend (cartridge SRAM owns slot-2 EXRAM as the
+; $6000-$7FFF WRAM mirror): a raw read has no shadow to consult. Fail
+; closed with a halt + marker rather than returning WRAM bytes as
+; nametable tiles. The projector (_npc_row) only reaches here on
+; scroll/teleport/band materialization.
+rt_raw_ciram_sram_read_locked:
+  ld   a, $e7
+  ld   ($cb1d), a
+  halt
+  jr   rt_raw_ciram_sram_read_locked
+
 .endif
 
 ; Map a NES PPU attribute-table address to the compact mirrored attribute
@@ -377,6 +389,7 @@ rt_nt_route_tile_write:
   ; call frame alone can cross the native stack guard during nested frame work.
   ld   c, a
 
+.ifdef RAW_CIRAM_BACKEND_SRAM
 .ifdef NES_MIRRORING_VERTICAL
   ld   a, d
   and  $07                   ; raw high byte within 2 KiB CIRAM
@@ -403,6 +416,11 @@ rt_nt_route_tile_write:
   ld   (hl), c
   xor  a
   ld   ($fffc), a
+.else
+  ; No EXRAM raw-CIRAM backend (cartridge SRAM owns slot-2 EXRAM): skip
+  ; the raw store; the row/column classification below still routes every
+  ; write to the folded/VDP paint path from the translated value.
+.endif
   ; row = ((D & 3) << 3) | (E >> 5); rows 0-3 (status region) always render.
   ld   a, e
   rlca

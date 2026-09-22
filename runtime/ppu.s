@@ -535,6 +535,7 @@ _ppudata_direct_nametable_tile:
   ; native stack guard while SMB clears/materializes nametables.
   ld   c, a
 
+.ifdef RAW_CIRAM_BACKEND_SRAM
 .ifdef NES_MIRRORING_VERTICAL
   ld   a, d
   and  $07                   ; raw high byte within 2 KiB CIRAM
@@ -573,6 +574,17 @@ _ppudata_direct_nametable_tile:
   ld   (hl), c
   xor  a
   ld   ($fffc), a
+.else
+  ; No EXRAM raw-CIRAM backend: slot-2 EXRAM belongs to cartridge SRAM
+  ; (mapper 4 WRAM $6000-$7FFF fully overlaps the $8000-$87FF shadow
+  ; window), so a raw shadow there would corrupt WRAM code/data on every
+  ; nametable write. Skip the store and force the repaint-skip flag to
+  ; "different" so projection always repaints from the translated value.
+.ifndef NES_CHR_RAM
+  xor  a
+  ld   ($ca33), a
+.endif
+.endif
 .ifdef NES_CHR_RAM
   ; Count nametable writes made with both NES render planes disabled. The
   ; PPUMASK enable edge uses this saturating count to distinguish a screen
