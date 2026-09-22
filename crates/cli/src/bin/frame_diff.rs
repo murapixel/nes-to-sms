@@ -1565,9 +1565,11 @@ struct SmsBus {
     slot_bank: [u8; 3],
     ram: [u8; 0x2000], // $C000-$DFFF, mirrored $E000-$FFFF
     // Cartridge SRAM (raw-CIRAM / CHR-RAM backend): mapped into slot 2
-    // when $FFFC bit 3 is set.
+    // when $FFFC bit 3 is set, with bit 2 selecting the 16 KiB bank
+    // (bank 0 = WRAM mirror for battery carts, bank 1 = raw-CIRAM shadow).
     sram: Vec<u8>,
     sram_enabled: bool,
+    sram_bank: usize,
     // VDP model (Phase S VDP-parity oracle): control-port latch, address
     // register with the 2-bit code, 16 KiB VRAM, 32-byte CRAM.
     vdp_latch: Option<u8>,
@@ -1595,8 +1597,9 @@ impl SmsBus {
             rom,
             slot_bank: [0, 1, 2],
             ram: [0; 0x2000],
-            sram: vec![0; 0x4000],
+            sram: vec![0; 0x8000],
             sram_enabled: false,
+            sram_bank: 0,
             vdp_latch: None,
             vdp_addr: 0,
             vdp_code: 0,
@@ -1634,7 +1637,7 @@ impl z80_emu::Bus for SmsBus {
             0x4000..=0x7FFF => self.rom_byte(self.slot_bank[1], addr - 0x4000),
             0x8000..=0xBFFF => {
                 if self.sram_enabled {
-                    self.sram[(addr - 0x8000) as usize]
+                    self.sram[self.sram_bank * 0x4000 + (addr - 0x8000) as usize]
                 } else {
                     self.rom_byte(self.slot_bank[2], addr - 0x8000)
                 }
@@ -1650,8 +1653,9 @@ impl z80_emu::Bus for SmsBus {
     fn write(&mut self, addr: u16, value: u8) {
         match addr {
             0x8000..=0xBFFF if self.sram_enabled => {
-                let i = (addr - 0x8000) as usize;
-                if i < 0x800 {
+                let off = (addr - 0x8000) as usize;
+                let i = self.sram_bank * 0x4000 + off;
+                if off < 0x800 {
                     self.ciram_writes += 1;
                     if self.sram[i] == value {
                         self.ciram_same += 1;
@@ -1676,7 +1680,10 @@ impl z80_emu::Bus for SmsBus {
                 }
             }
             0xE000..=0xFFFB => self.ram[(addr - 0xE000) as usize] = value,
-            0xFFFC => self.sram_enabled = value & 0x08 != 0,
+            0xFFFC => {
+                self.sram_enabled = value & 0x08 != 0;
+                self.sram_bank = usize::from(value & 0x04 != 0);
+            }
             0xFFFD => self.slot_bank[0] = value,
             0xFFFE => self.slot_bank[1] = value,
             0xFFFF => self.slot_bank[2] = value,

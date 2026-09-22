@@ -6781,6 +6781,61 @@ chr_kib = 8
     }
 
     #[test]
+    fn absolute_zp_inc_sta_emit_zp_mirror_without_warn() {
+        // Mother $C5A9/$C5BF/$C5C9 (post-lifter ZpConst): absolute-addressed
+        // zero page must hit the $C000 mirror, not $0000 (INC/DEC) and not a
+        // dropped store (STA).
+        let routine = make_routine(
+            "test_routine",
+            vec![
+                Op::IncMem {
+                    addr: AddrExpr::ZpConst(0x7B),
+                    region: MemRegion::ZeroPage,
+                },
+                Op::DecMem {
+                    addr: AddrExpr::ZpConst(0x7A),
+                    region: MemRegion::ZeroPage,
+                },
+                Op::LdaMem {
+                    addr: AddrExpr::ZpConst(0x7B),
+                    region: MemRegion::ZeroPage,
+                },
+                Op::StaMem {
+                    addr: AddrExpr::ZpConst(0x7B),
+                    region: MemRegion::ZeroPage,
+                },
+                Op::Rts,
+            ],
+        );
+        let mut prog = z80_emit::Program::new();
+        define_runtime_stubs(&mut prog);
+        prog.org(0x0000);
+        lower_routine(&mut prog, &routine, &LowerOptions::default()).unwrap();
+        let build = prog.finish().unwrap();
+        assert!(
+            !build
+                .asm
+                .contains("WARN: complex addr for rw-mem operation")
+        );
+        assert!(
+            !build
+                .asm
+                .contains("WARN: unresolved StaMem addressing mode")
+        );
+        assert!(
+            !build
+                .asm
+                .contains("WARN: unresolved LdaMem addressing mode")
+        );
+        assert!(build.asm.contains("ld hl,$C07B"));
+        assert!(build.asm.contains("inc (hl)"));
+        assert!(build.asm.contains("ld hl,$C07A"));
+        assert!(build.asm.contains("ld a,($C07B)"));
+        assert!(build.asm.contains("ld ($C07B),a"));
+        assert!(!build.asm.contains("ld hl,$0000"));
+    }
+
+    #[test]
     fn mmc3_copy_loop_from_window_falls_back_to_helpers() {
         let prof = mmc3_test_profile();
         let opts = LowerOptions {

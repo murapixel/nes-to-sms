@@ -632,6 +632,15 @@ fn make_addr_expr(insn: &Instruction) -> Option<(AddrExpr, u16)> {
         (AddrMode::ZeroPage, Operand::Addr(a)) => Some((AddrExpr::ZpConst(a as u8), a)),
         (AddrMode::ZeroPageX, Operand::Addr(a)) => Some((AddrExpr::ZpIndexedX(a as u8), a)),
         (AddrMode::ZeroPageY, Operand::Addr(a)) => Some((AddrExpr::ZpIndexedY(a as u8), a)),
+        // Absolute addressing into $0000-$00FF touches the same byte as
+        // zero-page mode (no index: no wrap/page difference). Normalize to
+        // ZpConst so the lowerer emits the zero-page mirror; otherwise an
+        // absolute-addressed low byte lifts to (Const, ZeroPage), which no
+        // lowerer arm handles (Mother $C5A9 INC $007B mistargeted $0000,
+        // $C5BF STA $007B silently dropped).
+        (AddrMode::Absolute, Operand::Addr(a)) if a < 0x100 => {
+            Some((AddrExpr::ZpConst(a as u8), a))
+        }
         (AddrMode::Absolute, Operand::Addr(a)) => Some((AddrExpr::Const(a), a)),
         (AddrMode::AbsoluteX, Operand::Addr(a)) => Some((AddrExpr::AbsIndexedX(a), a)),
         (AddrMode::AbsoluteY, Operand::Addr(a)) => Some((AddrExpr::AbsIndexedY(a), a)),
@@ -1922,6 +1931,43 @@ mod tests {
         let rts_pos = r.ops.iter().position(|o| o == &Op::Rts).unwrap();
         assert!(label_pos < rts_pos);
         assert!(r.ops.contains(&Op::Rts));
+    }
+
+    #[test]
+    fn lift_absolute_low_byte_normalizes_to_zp() {
+        // Mother $C5A9: the game addresses zero page with absolute mode
+        // (EE 7B 00 = INC $007B, CE 7A 00 = DEC $007A, 8D 7B 00 =
+        // STA $007B, AD 7B 00 = LDA $007B). The effective address is the
+        // same byte zero-page mode would touch, so lift ZpConst and keep
+        // the ZeroPage region instead of an unhandled (Const, ZeroPage).
+        let r = lift(
+            0x8000,
+            &[
+                0xEE, 0x7B, 0x00, 0xCE, 0x7A, 0x00, 0x8D, 0x7B, 0x00, 0xAD, 0x7B, 0x00, 0x60,
+            ],
+        );
+        assert!(r.ops.contains(&Op::IncMem {
+            addr: AddrExpr::ZpConst(0x7B),
+            region: MemRegion::ZeroPage,
+        }));
+        assert!(r.ops.contains(&Op::DecMem {
+            addr: AddrExpr::ZpConst(0x7A),
+            region: MemRegion::ZeroPage,
+        }));
+        assert!(r.ops.contains(&Op::StaMem {
+            addr: AddrExpr::ZpConst(0x7B),
+            region: MemRegion::ZeroPage,
+        }));
+        assert!(r.ops.contains(&Op::LdaMem {
+            addr: AddrExpr::ZpConst(0x7B),
+            region: MemRegion::ZeroPage,
+        }));
+        // Absolute above $00FF still lifts to Const with its own region.
+        let r2 = lift(0x8000, &[0xAD, 0x00, 0x02, 0x60]);
+        assert!(r2.ops.contains(&Op::LdaMem {
+            addr: AddrExpr::Const(0x0200),
+            region: MemRegion::Ram,
+        }));
     }
 
     #[test]

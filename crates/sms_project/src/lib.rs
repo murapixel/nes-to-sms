@@ -63,6 +63,11 @@ pub enum RawCiramBackend {
     /// with mapper control $FFFC bit 3 set. The first 2 KiB ($8000-$87FF)
     /// are reserved for mirrored NES CIRAM.
     SramSlot2,
+    /// Same 2 KiB window ($8000-$87FF) in SRAM bank 1 ($FFFC = $0C:
+    /// bit 3 enable + bit 2 bank select). For cartridge-SRAM (battery)
+    /// carts, where bank 0 holds the $6000-$7FFF WRAM mirror and would
+    /// be corrupted by a bank-0 raw shadow.
+    SramSlot2Bank1,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -621,6 +626,11 @@ fn sms_asm_content(
          .define RAW_CIRAM_BACKEND_SRAM 1\n\
          .define RAW_CIRAM_SRAM_BASE $8000\n\
          .define RAW_CIRAM_SRAM_CTRL $08"
+            .to_string(),
+        RawCiramBackend::SramSlot2Bank1 => "\
+         .define RAW_CIRAM_BACKEND_SRAM 1\n\
+         .define RAW_CIRAM_SRAM_BASE $8000\n\
+         .define RAW_CIRAM_SRAM_CTRL $0C"
             .to_string(),
     };
     let mut out = format!(
@@ -1597,6 +1607,47 @@ mod tests {
         assert!(sms_asm.contains(".define RAW_CIRAM_BACKEND_SRAM 1"));
         assert!(sms_asm.contains(".define RAW_CIRAM_SRAM_BASE $8000"));
         assert!(sms_asm.contains(".define RAW_CIRAM_SRAM_CTRL $08"));
+
+        fs::remove_dir_all(&out).unwrap();
+    }
+
+    #[test]
+    fn test_sms_asm_contains_raw_ciram_sram_bank1_defines() {
+        // Battery carts keep the $6000-$7FFF WRAM mirror in SRAM bank 0,
+        // so the raw-CIRAM shadow takes the same $8000-$87FF window in
+        // bank 1 ($FFFC = $0C).
+        let out = unique_dir("sms_proj_raw_ciram_bank1");
+        let build = minimal_build();
+        let assets = minimal_assets();
+        let cfg = ProjectConfig {
+            mapper: 0,
+            uxrom_bank_count: None,
+            uxrom_bus_conflicts: None,
+            mmc3_prg_half_count: None,
+            mmc3_chr_count: None,
+            chr_ram: false,
+            input_action: false,
+            input_pause_start: false,
+            scroll_split: true,
+            top_tile_remap_rows: 0,
+            top_tile_remap_from: Vec::new(),
+            top_tile_remap_to: 0,
+            chr_ram_bg_identity: false,
+            rom_kib: 512,
+            region: 0x4C,
+            title: "TEST",
+            mirroring: NesMirroring::Vertical,
+            raw_ciram_backend: RawCiramBackend::SramSlot2Bank1,
+            native_calls: false,
+            runtime_defines: Vec::new(),
+        };
+
+        emit_project(&out, &build, &assets, &cfg, None).unwrap();
+
+        let sms_asm = fs::read_to_string(out.join("sms.asm")).unwrap();
+        assert!(sms_asm.contains(".define RAW_CIRAM_BACKEND_SRAM 1"));
+        assert!(sms_asm.contains(".define RAW_CIRAM_SRAM_BASE $8000"));
+        assert!(sms_asm.contains(".define RAW_CIRAM_SRAM_CTRL $0C"));
 
         fs::remove_dir_all(&out).unwrap();
     }

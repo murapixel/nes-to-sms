@@ -85,14 +85,15 @@ impl From<sms_project::EmitError> for Error {
 /// could turn an unsupported store into a wrong bank switch. Other lowering
 /// errors remain diagnostics while the converter's broader coverage grows.
 /// Raw-CIRAM shadow backend selection. Cartridge SRAM (iNES battery bit)
-/// owns slot-2 SMS EXRAM as the $6000-$7FFF WRAM mirror, which fully
-/// overlaps the 2 KiB EXRAM raw-CIRAM shadow ($8000-$87FF); keeping the
-/// shadow there would corrupt WRAM code/data on every nametable write
-/// (frame-1213 Mother $0074/$0075 divergence via clobbered $60B3/$60B4),
-/// so SRAM carts run without the EXRAM shadow (projection repaints).
+/// owns slot-2 SMS EXRAM bank 0 as the $6000-$7FFF WRAM mirror, which fully
+/// overlaps the bank-0 2 KiB EXRAM raw-CIRAM shadow ($8000-$87FF); keeping
+/// the shadow there would corrupt WRAM code/data on every nametable write
+/// (frame-1213 Mother $0074/$0075 divergence via clobbered $60B3/$60B4).
+/// SRAM carts therefore take the same 2 KiB window in EXRAM bank 1
+/// ($FFFC = $0C), leaving bank 0 ($FFFC = $08) to WRAM.
 fn raw_ciram_backend_for(has_battery: bool) -> RawCiramBackend {
     if has_battery {
-        RawCiramBackend::None
+        RawCiramBackend::SramSlot2Bank1
     } else {
         RawCiramBackend::SramSlot2
     }
@@ -3255,8 +3256,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sram_carts_disable_exram_raw_ciram_backend() {
-        assert_eq!(raw_ciram_backend_for(true), RawCiramBackend::None);
+    fn sram_carts_use_bank1_exram_raw_ciram_backend() {
+        assert_eq!(raw_ciram_backend_for(true), RawCiramBackend::SramSlot2Bank1);
         assert_eq!(raw_ciram_backend_for(false), RawCiramBackend::SramSlot2);
     }
 
