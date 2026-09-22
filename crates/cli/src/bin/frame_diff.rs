@@ -1840,6 +1840,25 @@ fn nes_buttons_to_sms_dc(b: Buttons) -> u8 {
     !pressed // active-low
 }
 
+/// Subject-side $DC encoding of one FD_PAD_RAW event. When the run targets
+/// an action-mode profile (`FD_PAUSE_START`: NES Start lives on the SMS
+/// Pause NMI, never on a face button), raw Start/Select must NOT be folded
+/// onto $DC bits 5/4: the action-mode latch (`runtime/input.s`
+/// `_latch_game_buttons`) reads those bits as NES B/A, so mapping them
+/// would inject phantom B/A presses the reference never sees (Mother
+/// frame-1100 lockstep: ref $00C0=$10 Start-only vs subj $00C0=$50
+/// B+Start). Start travels via `--pause-at-frame`/`FD_PAUSE_AT` only;
+/// Select has no SMS face-button path in this mode and is dropped the same
+/// way rather than aliasing A. Game-agnostic: gated on the existing
+/// opt-in knob, never on profile facts.
+fn raw_subject_dc(buttons: u8, pause_start: bool) -> u8 {
+    let mut b = buttons;
+    if pause_start {
+        b &= !(Buttons::START | Buttons::SELECT);
+    }
+    nes_buttons_to_sms_dc(Buttons(b))
+}
+
 // ---------------------------------------------------------------------------
 // Subject pause (SMS PAUSE button) injector
 // ---------------------------------------------------------------------------
@@ -2608,11 +2627,14 @@ fn main() {
         // mapped through the SMS $DC encoding. The reference uses the
         // exact raw NES set (raw_timeline); this derived timeline only
         // feeds the subject, whose runtime face mapping is fixed.
+        // Action-mode profiles (FD_PAUSE_START) keep Start/Select off the
+        // face bits (see raw_subject_dc): Start arrives via the pause NMI.
+        let pause_start = std::env::var("FD_PAUSE_START").is_ok();
         (
             ButtonTimeline::from_events(
                 events
                     .iter()
-                    .map(|(frame, buttons)| (*frame, nes_buttons_to_sms_dc(Buttons(*buttons))))
+                    .map(|(frame, buttons)| (*frame, raw_subject_dc(*buttons, pause_start)))
                     .collect(),
             ),
             format!("FD_PAD_RAW({} events)", events.len()),
@@ -3082,6 +3104,29 @@ mod tests {
             effective_nes_buttons(45, &timeline, 0, Some(&raw)),
             Buttons::RIGHT
         );
+    }
+
+    /// Action-mode lockstep (FD_PAUSE_START) must not fold raw Start
+    /// onto the subject's $DC face bits: bit5 latches as NES B there, the
+    /// phantom-B $00C0=$50 divergence against a Start-only reference.
+    /// Raw Select is dropped the same way (bit4 latches as NES A).
+    #[test]
+    fn pause_start_mode_keeps_start_and_select_off_subject_dc() {
+        // Default mapping (title-style): Start -> bit5, Select -> bit4.
+        assert_eq!(raw_subject_dc(Buttons::START, false) & (1 << 5), 0);
+        assert_eq!(raw_subject_dc(Buttons::SELECT, false) & (1 << 4), 0);
+        // Action mode: both stripped, port fully released; A/B pass through.
+        assert_eq!(raw_subject_dc(Buttons::START, true), 0xFF);
+        assert_eq!(raw_subject_dc(Buttons::SELECT, true), 0xFF);
+        assert_eq!(
+            raw_subject_dc(Buttons::START | Buttons::A, true) & (1 << 4),
+            0
+        );
+        assert_ne!(
+            raw_subject_dc(Buttons::START | Buttons::A, true) & (1 << 5),
+            0
+        );
+        assert_eq!(raw_subject_dc(Buttons::B, true) & (1 << 5), 0);
     }
 
     #[test]
