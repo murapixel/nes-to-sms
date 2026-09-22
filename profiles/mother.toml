@@ -50,6 +50,26 @@ name = "XferCA89"
 addr = 0xC9C7
 name = "XferC9C7"
 
+# Third JMP ($007C) transfer-loop head in the same $C9B5/$C9E5 engine:
+# $C9F9 is the JSR $CBBD return continuation at $C9F6 (same pattern as
+# $C9C7 after the JSR $CBBD at $C9C4), so the analyzer never made it a
+# dispatch-table record. Every JMP ($007C) with ($007C)=$C9F9 (pointer
+# set at $CA06-$CA0C) therefore missed and _btd_miss realigned forward
+# to the next fixed-bank entry >= $C9F9, which is $CA19: STA $72 ran
+# with the arm's stale accumulator (frame-1206: A=$1C residue after the
+# $CAAF $CAC0 loop) instead of the transfer byte, and the out-of-table
+# RTS read $CA5E/$CA5F=$A400 -> target $A401 -> $E2 miss trap
+# (id=$A401). Byte-verified: $C9F9 = C6 7F (DEC $7F); reference
+# FD_TRACE_PC frame=1206 bank=30 pc=$CAAC -> JMP ($007C); subject
+# FD_TRACE_PC_SUBJ frame=1206 pc=$7768 ($CACD) -> pc=$7126 (L_CA19)
+# with A=$1C and no $C9F9-loop dispatch in between. Overlaps the $C9E5
+# walk — same bytes, entry label only. No bank numbers invented:
+# fixed $C000-$DFFF window (bank 30), same as its $C9C7 sibling.
+
+[[function]]
+addr = 0xC9F9
+name = "XferC9F9"
+
 # $CA19 is an inline RTS jump-table dispatcher (not a profiled
 # [[jump_engine]]: its table is not laid out at JSR caller+3):
 #   $CA19: STA $72; ASL A; TAY
