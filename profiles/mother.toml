@@ -1079,3 +1079,31 @@ bank = 19
 [[bank_entry]]
 bank = 20
 addr = 0x9457
+
+# Frontier batch 2026-09-22 (bank-20 $9457-arm tail JMP $BF31): the walk4
+# route (name-reg + overworld, /tmp/toolchain/probe/walk4.txt, FD_PAUSE_START=1
+# with FD_PAUSE_AT=1100,1850,2150,2450,2750,3050) traps $E1 id=$000C on the
+# 7000-frame lockstep (frontier_walk4_7000.log; also with 4-frame Start
+# holds in /tmp/toolchain/walk4_4f.txt, frontier_walk4_4f_7000.log — first
+# divergence there is the genuine frame-3229 $0060/$0061 pair, not input
+# mismatch). id=$000C is the L_BF31 strict-trap stub, whose ONLY code
+# reference is the $946F JMP $BF31 tail gate of the seeded $9457 arm
+# (translated.asm: `ld bc,L_BF31; ld a,:L_BF31; jp rt_translated_tail_gate`).
+# Correction to 1ebc8b0: the tail does NOT resolve via the dispatch-table
+# row (row $BF31 -> L_b19_BF31 exists, but the tail gate loads the
+# unresolved L_BF31 stub address). rewrite_bank_call_targets covers Op::Jmp,
+# so this binding retargets the tail to the existing L_b19_BF31.
+# Provenance (own runs, this session, walk4 route --ref-only 7000 frames):
+# - MMC3_ENTRY bank8=19 addr=0xbf31 (harv_walk4_7000.log, 83-entry set).
+# - FD_TRACE_PC=943B,9457,BF31: frame=1500 bank=20 pc=$943B -> pc=$9457
+#   (X=$08) and frame=5430 bank=19 pc=$BF31 (tpc_bf31_walk4.log). Bank 19 is
+#   harvest-observed, never invented.
+# - Byte spot-check: bank19 $BF31 = AD 02 74 (LDA $7402) 20 95 BF
+#   (JSR $BF95) 20 AD BF (JSR $BFAD) 20 6F FE (JSR $FE6F) 38 (SEC) — the
+#   lifted L_b19_BF31 body verbatim (callees $BF95/$BFAD are harvested and
+#   seeded); bank20 $946F = 4C 31 BF (JMP $BF31).
+# The bank-19-internal $A15C JSR $BF31 lowers to `jp L_b19_BF31` directly
+# and is unaffected by this binding (rewrite key is the bare L_BF31 only).
+[[bank_call]]
+target = 0xbf31
+bank = 19
