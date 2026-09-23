@@ -13,6 +13,36 @@ irq = 0xFE7B
 mode = "action"
 pause_start = true
 
+# Input ground truth (trap-triage 2026-09-23, walk4 route ref-only traces):
+# Mother's NMI sampler at $FEB3 bit-REVERSES the pad byte. Each $4016 bit is
+# LSR'd into carry and ROL'd into $C0/$C1, so the first-read bit (A) ends up
+# at bit 7, not bit 0. Game-space masks (as the waits below test them):
+#   A=$80 B=$40 Select=$20 Start=$10 Up=$08 Down=$04 Left=$02 Right=$01.
+# Do NOT "fix" masks that look shifted (e.g. the title wait's AND #$10 IS
+# Start, and the bank-30 menu's AND #$C0 IS A/B) -- the oracle returns real
+# hardware serial bits (0x40|bit) and both sides agree bit-exactly.
+# Button-wait inventory (all advance on delivered edges; none is timer-gated):
+#   title $9EA0 loop (AND #$10 = START, exits frame 1100 on Start),
+#   name-reg $F09C any-key wait ($DA nonzero; every A/B/Start press exits and
+#     re-enters within ~1-36 frames through the whole 1222-4988 name-reg),
+#   intro-story $F390 A/B wait (AND #$C0; pages turn on A@5200/5400/...),
+#   bank-30 $CCB0 loop (LDY $DA + AND #$C0: A->$A178 / B->$A000 / else $A123).
+# The $943B RTS-dispatch (table $944D) is a ONE-SHOT: it runs exactly once
+# (frame 1500, Y=$82=1, selector 4 -> arm $9457), so "$9457 fires only once"
+# is by design, not a stall. The $E0/$E1 NMI frame timer ($F947-$F965) ticks
+# normally on both sides (E0 re-arm $F8BB / expire->FD22 observed ref 5689x
+# per 8000 frames; subject executes the same translated path with identical
+# values). Harvests that look "stuck in the intro dialogue" are routes with
+# no further inputs: the game correctly parks in $F09C awaiting the next key.
+# Route-authoring note: the subject delivers pause-Start as a 4-frame tap
+# ($CB2E countdown, runtime/input.s + frame-diff pause injector) while pad
+# scripts model human holds (walk4.txt holds Start 30 frames). Each Start
+# press therefore diverges $C0/$DE for 26 frames post-tap (1104-1129 etc.;
+# 156 frames over six presses on walk4@3500) and self-heals on release.
+# walk4_4f.txt (4-frame Start holds) is duration-matched and fully clean
+# through the same region -- use it when a zero-transient baseline is needed.
+# A-press parity is exact (full 30-frame holds both sides).
+
 # Static WRAM code blob (see the WRAM-code blocker grounding at the
 # overworld bank-entry block, $951A JSR $6047). Mother copies 3 KiB from
 # CHR ROM offset $1E800 to WRAM $6000-$6BFF at the title->game transition
@@ -296,6 +326,17 @@ bank = 19
 # $9C11 / $9C15, which set X and converge on $9C17 (`JSR $FE6F; STX $7418;
 # JMP $FE75`). Bound as a [[jump_engine]] so the walker stops at the table
 # and the targets root as bank-20 entries instead of tripping fail-closed.
+# Scratch-bypass note (trap-triage 2026-09-23, walk4 route frame 3229): the
+# lowered compare-chain jumps straight to the targets and SKIPS the helper
+# body, so the reference's PLA/PLA side effect ($60/$61 <- inline-data
+# pointer; ref $06/$9C at 3229) never happens on the subject (stale $00/$80).
+# This is a KNOWN, HARMLESS transient, not a miscompile to fix by executing
+# the helper (that would walk inline table bytes as code): $FE6F/$FE75 (two
+# STA $A001 + RTS) never read $60/$61, nothing in the 3229-3258 window reads
+# the stale bytes (no cascade), and the next $60 writer realigns both sides
+# (both $D2 at frame 3259; lockstep fully clean 3259-3500). Same-signature
+# future divergences (2 bytes, $60/$61-class scratch, self-healing <64f)
+# should be triaged as bypass transients first.
 
 [[jump_engine]]
 caller = 0x9C04
