@@ -1317,6 +1317,12 @@ fn run_reference(
         let _ = std::fs::create_dir_all(dir);
     }
     let mut snaps: Vec<[u8; 0x800]> = Vec::with_capacity(frames);
+    // FD_MMC3_DUMP=<file> — per-frame reference MMC3 + PPUCTRL state
+    // (bank-select, R0-R7, mirroring, sprite/BG tables). Grounds
+    // CHR-bankswitch animation (e.g. bank-swapped sprite frames) that RAM
+    // parity cannot see: the mapper registers live outside NES RAM.
+    let mmc3_dump_path: Option<String> = std::env::var("FD_MMC3_DUMP").ok();
+    let mut mmc3_dump_lines: Vec<String> = Vec::new();
     for frame in 0..frames {
         bus.current_frame = Some(frame);
         bus.buttons = effective_nes_buttons(
@@ -1475,7 +1481,25 @@ fn run_reference(
                 bus.mmc3.prg_mode()
             );
         }
+        if mmc3_dump_path.is_some() {
+            let r = bus.mmc3.regs;
+            mmc3_dump_lines.push(format!(
+                "{frame} sel={:02X} R0={:02X} R1={:02X} R2={:02X} R3={:02X} R4={:02X} R5={:02X} R6={:02X} R7={:02X} mir={} ppu_ctrl={:02X}",
+                bus.mmc3.bank_select,
+                r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7],
+                if bus.mmc3.horizontal_mirroring { "H" } else { "V" },
+                bus.ppu_ctrl
+            ));
+        }
         snaps.push(bus.ram);
+    }
+    if let Some(path) = &mmc3_dump_path {
+        let text = mmc3_dump_lines.join("\n") + "\n";
+        let _ = std::fs::write(path, text);
+        eprintln!(
+            "  [mmc3] dumped {} per-frame MMC3 states",
+            mmc3_dump_lines.len()
+        );
     }
     if call_log_frame.is_some() {
         for (f, b, pc, t) in &call_log {
