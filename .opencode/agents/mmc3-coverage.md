@@ -1,7 +1,7 @@
 ---
 description: MMC3 coverage grind — harvest fixed-to-window refs and grow profiles/mother.toml seeds (HIGH window, LOW leftovers, overworld banks). Never invent bank numbers; return seed blocks, do not commit.
 mode: all
-model: opencode/muse-spark-1.3-contributor-free
+model: opencode-go/deepseek-v4-flash
 temperature: 0.2
 steps: 160
 permission:
