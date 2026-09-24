@@ -2511,6 +2511,32 @@ fn run_subject(
             );
         }
         snaps.push(snap_nes_ram(&bus));
+        if let Ok(sf) = std::env::var("FD_SUBJ_RAM_FRAME") {
+            if let Ok(n) = sf.parse::<usize>() {
+                if _frame == n {
+                    if let Ok(path) = std::env::var("FD_SUBJ_RAM_DUMP") {
+                        let _ = std::fs::write(&path, &bus.ram);
+                        eprintln!(
+                            "  [subjram] dumped subject RAM at frame {n} ({} bytes) to {path}",
+                            bus.ram.len()
+                        );
+                    }
+                }
+            }
+        }
+        if let Ok(vf) = std::env::var("FD_VRAM_FRAME") {
+            if let Ok(n) = vf.parse::<usize>() {
+                if _frame == n {
+                    if let Ok(path) = std::env::var("FD_VRAM_DUMP") {
+                        let _ = std::fs::write(&path, &bus.vram);
+                        eprintln!(
+                            "  [vram] dumped subject VRAM at frame {n} ({} bytes) to {path}",
+                            bus.vram.len()
+                        );
+                    }
+                }
+            }
+        }
         if vdp_dump.is_some() || vdp_check.is_some() {
             vdp_hashes.push(bus.vdp_hash());
         }
@@ -2544,6 +2570,17 @@ fn run_subject(
         eprintln!(
             "  [vdp] dumped {} per-frame VRAM+CRAM hashes",
             vdp_hashes.len()
+        );
+    }
+    // FD_VRAM_DUMP=<file>: write the subject's 16 KiB VRAM (raw) so
+    // sprite-pattern / SAT content can be inspected byte-level (hashes only
+    // tell whether something changed, not what it changed to). With
+    // FD_VRAM_FRAME=<n> the dump is taken at that frame instead of the end.
+    if let Ok(path) = std::env::var("FD_VRAM_DUMP") {
+        let _ = std::fs::write(&path, &bus.vram);
+        eprintln!(
+            "  [vram] dumped subject VRAM ({} bytes) to {path}",
+            bus.vram.len()
         );
     }
     if let Some(golden) = &vdp_check {
