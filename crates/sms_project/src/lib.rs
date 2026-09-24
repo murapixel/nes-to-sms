@@ -82,11 +82,15 @@ pub enum UxromBusConflicts {
 // the image at 512 KiB matters: 1 MiB Sega-mapper support is spotty in both
 // GPGX and Mednafen.
 pub const NES_PRG_BANK_BASE: u32 = 21;
-// MMC3 layout (1 MiB image; trace_sms verifies it — real-emulator 1 MiB
-// support is a known follow-up): translated code still 4-20, PRG pair
-// banks at MMC3_PRG_BASE (16 pairs = 32 halves for 256 KiB PRG), converted
-// CHR groups at MMC3_CHR_BASE (16 groups of 8 KiB = 128 KiB CHR), small
-// assets above. A 256 KiB / 128 KiB cart needs banks 21-52 + 53-54.
+// MMC3 compact layout (Mednafen SMS ceiling is 1 MiB = 64 banks; the image
+// must stay under it with zero pad banks): translated code still 4-20, PRG
+// pair banks at MMC3_PRG_BASE (16 pairs = 32 halves for 256 KiB PRG),
+// converted CHR groups at MMC3_CHR_BASE (16 groups of 8 1 KiB banks =
+// 128 KiB CHR), converted CHR + palette + maps + WRAM blob packed into the
+// two small-asset banks right above, then the raw CHR banks for the banked
+// $2007 pattern reader. A 256 KiB / 128 KiB cart needs banks 21-54 + 55-62
+// (63 banks = 1008 KiB). True 512 KiB is out of reach: translated code
+// (~272 KiB) + PRG pairs (256 KiB) alone exceed it, before either CHR copy.
 pub const MMC3_PRG_BASE: u32 = 21;
 pub const MMC3_CHR_BASE: u32 = 37;
 
@@ -94,6 +98,12 @@ const PACKED_PALETTE_OFFSET: u32 = 0x0000;
 const PACKED_NAMETABLE_OFFSET: u32 = 0x0020;
 const PACKED_CHR_NES_OFFSET: u32 = 0x0720;
 const PACKED_CHR_MAPS_OFFSET: u32 = 0x2720;
+// WRAM blob image (table + bytes) shares the packed small-asset bank
+// (asset_base + 1) with palette/nametable/maps. Only used when the packed
+// UxROM chr.nes is absent (MMC3 ships raw CHR in dedicated banks above),
+// so 0x1000..PACKED_CHR_MAPS_OFFSET is free there on every mapper that
+// emits blobs.
+const PACKED_WRAM_BLOB_OFFSET: u32 = 0x1000;
 
 #[derive(Debug, Clone)]
 pub struct ProjectConfig<'a> {
@@ -362,27 +372,47 @@ fn validate_config(
         }
         required_bank = required_bank.max(asset_base + 1);
     } else {
-        for (enabled, offset) in [
-            (true, 0),
-            (true, 1),
-            (assets.nametable.is_some(), 2),
-            (assets.prg_low.is_some(), 3),
-            (assets.chr_nes.is_some(), 4),
-            (assets.chr_maps.is_some(), 5),
-            (assets.prg_high.is_some(), 6),
-            (!assets.wram_blobs.is_empty(), 7),
-        ] {
-            if enabled {
-                required_bank = required_bank.max(asset_base + offset);
+        // NROM/UxROM packed-bank layout: offsets 0-7 share the small-asset
+        // banks. MMC3 places these differently (maps/blob share asset_base
+        // + 1, raw CHR starts at + 2, fixed PRG aliases the final pair), so
+        // the NROM offsets below only apply when no MMC3 pairs exist —
+        // counting them for MMC3 would phantom-reserve banks the image
+        // never emits and defeat compact sizing on small CHR carts.
+        if assets.mmc3_prg_pairs.is_none() {
+            for (enabled, offset) in [
+                (true, 0),
+                (true, 1),
+                (assets.nametable.is_some(), 2),
+                (assets.prg_low.is_some(), 3),
+                (assets.chr_nes.is_some(), 4),
+                (assets.chr_maps.is_some(), 5),
+                (assets.prg_high.is_some(), 6),
+                (!assets.wram_blobs.is_empty(), 7),
+            ] {
+                if enabled {
+                    required_bank = required_bank.max(asset_base + offset);
+                }
             }
         }
         // MMC3 also ships the FULL raw CHR image (banked $2007 pattern
         // reads) as ceil(len/16KiB) banks starting just above the packed
-        // asset banks (asset_base + 8).
+        // asset banks (asset_base + 2). The WRAM blob image shares the
+        // packed bank (asset_base + 1) with palette/maps, so it must fit
+        // between PACKED_WRAM_BLOB_OFFSET and the maps at
+        // PACKED_CHR_MAPS_OFFSET.
         if assets.mmc3_prg_pairs.is_some() {
             if let Some(chr_nes) = &assets.chr_nes {
                 let chr_banks = chr_nes.len().div_ceil(0x4000) as u32;
-                required_bank = required_bank.max(asset_base + 8 + chr_banks.saturating_sub(1));
+                required_bank = required_bank.max(asset_base + 2 + chr_banks.saturating_sub(1));
+            }
+            if !assets.wram_blobs.is_empty() {
+                let blob_image: usize = assets.wram_blobs.iter().map(|b| 4 + b.bytes.len()).sum();
+                if blob_image > (PACKED_CHR_MAPS_OFFSET - PACKED_WRAM_BLOB_OFFSET) as usize {
+                    return Err(EmitError::InvalidUxromConfig(
+                        "WRAM blob image exceeds the packed asset bank window".into(),
+                    ));
+                }
+                required_bank = required_bank.max(asset_base + 1);
             }
         }
     }
@@ -596,12 +626,14 @@ fn sms_asm_content(
             chr_1k - 1
         ));
         // Raw (2bpp) CHR image for the banked $2007 pattern reader lives at
-        // asset_base + 8, in 16 KiB banks holding 16 1 KiB CHR banks each.
+        // asset_base + 2, in 16 KiB banks holding 16 1 KiB CHR banks each.
         // The runtime resolves R0-R5 -> chr1k -> bank (chr1k>>4) + offset
-        // ((chr1k&15)<<10 | addr&$3FF).
+        // ((chr1k&15)<<10 | addr&$3FF). Packed tight against the small
+        // assets: the image must stay under the 1 MiB real-emulator ceiling
+        // with no spare banks (see the MMC3 layout note at MMC3_PRG_BASE).
         mapper_define.push_str(&format!(
             "\n.define NES_MMC3_CHR_NES_BASE {}",
-            asset_base + 8
+            asset_base + 2
         ));
     }
 
@@ -613,7 +645,7 @@ fn sms_asm_content(
         mapper_define.push_str(&format!(
             "\n.define WRAM_BLOB_COUNT {}\n.define WRAM_BLOB_BANK {}",
             assets.wram_blobs.len(),
-            asset_base + 7
+            asset_base + 1
         ));
     }
     let mirroring_define = match cfg.mirroring {
@@ -810,7 +842,7 @@ fn sms_asm_content(
             // 16i..16i+15 (see NES_MMC3_CHR_NES_BASE in mapper_define).
             let chr_nes = assets.chr_nes.as_ref().expect("checked is_some");
             let chr_banks = chr_nes.len().div_ceil(0x4000);
-            let base = asset_base + 8;
+            let base = asset_base + 2;
             for (i, _) in (0..chr_banks).enumerate() {
                 let bank = base + i as u32;
                 out.push_str(&format!(
@@ -868,18 +900,23 @@ fn sms_asm_content(
     }
 
     if !assets.wram_blobs.is_empty() {
-        let wram_bank = asset_base + 7;
+        // Shares the packed small-asset bank (asset_base + 1) with
+        // palette/nametable/maps: those live below PACKED_WRAM_BLOB_OFFSET
+        // and at/above PACKED_CHR_MAPS_OFFSET, so the blob window in
+        // between is free. Keeps the image contiguous (no spare banks).
+        let wram_bank = asset_base + 1;
         out.push_str(&format!(
             "\n\
              .bank {wram_bank} slot 2\n\
-             .org $0000\n\
+             .org ${:04X}\n\
              .section \"data_wram_blobs\" force\n\
              data_wram_blob_table:\n\
              .incbin \"data/wram_blob_table.bin\"\n\
              .dw $0000\n\
              data_wram_blob_data:\n\
              .incbin \"data/wram_blobs.bin\"\n\
-             .ends\n"
+             .ends\n",
+            PACKED_WRAM_BLOB_OFFSET
         ));
     }
 
@@ -1513,6 +1550,113 @@ mod tests {
         );
         // The bank image is still emitted for the runtime to copy from.
         assert!(sms_asm.contains("data_wram_blobs"));
+    }
+
+    #[test]
+    fn test_mmc3_compact_layout_no_gap_banks() {
+        // Compact MMC3 layout: the WRAM blob shares the packed small-asset
+        // bank (asset_base + 1) with palette/maps, and the raw CHR banks for
+        // the banked $2007 reader start at asset_base + 2 — no spare banks
+        // between code/PRG/CHR/assets. The image must stay under Mednafen's
+        // 1 MiB SMS ceiling (regression: the old asset_base + 7 blob bank
+        // pushed Mother to 69 banks = 1104 KiB, rejected outright).
+        let mut cfg = minimal_cfg();
+        cfg.mapper = 4;
+        cfg.mmc3_prg_half_count = Some(32);
+        cfg.mmc3_chr_count = Some(128);
+        // 16 PRG pairs + 16 CHR groups, mirroring a 256 KiB / 128 KiB cart.
+        let mut assets = minimal_assets();
+        assets.mmc3_prg_pairs = Some(vec![vec![0u8; 0x4000]; 16]);
+        assets.mmc3_chr_groups = Some(vec![vec![0u8; 0x4000]; 16]);
+        assets.chr_nes = Some(vec![0u8; 0x20000]);
+        assets.chr_maps = Some(vec![0u8; 0x600]);
+        assets.wram_blobs = vec![WramBlobAsset {
+            dest: 0x6000,
+            bytes: vec![0u8; 0xC00],
+        }];
+
+        let asset_base = MMC3_CHR_BASE + 16;
+        // Exact banks used: asset_base + 2 + 8 raw CHR banks; rom_kib must
+        // match the pipeline's compact formula.
+        cfg.rom_kib = (asset_base + 2 + 8) * 16;
+
+        let runtime_s_files = vec![PathBuf::from("boot.s"), PathBuf::from("mapper_mmc3.s")];
+        let sms_asm = sms_asm_content(&cfg, &assets, false, &runtime_s_files);
+
+        // Blob bank define points at the packed bank, not a dedicated one.
+        assert!(
+            sms_asm.contains(&format!("\n.define WRAM_BLOB_BANK {}", asset_base + 1)),
+            "WRAM blob must live in the packed small-asset bank"
+        );
+        assert!(
+            sms_asm.contains(&format!(
+                "\n.define NES_MMC3_CHR_NES_BASE {}",
+                asset_base + 2
+            )),
+            "raw CHR must start right above the packed bank"
+        );
+        // The blob section shares the packed bank at a non-overlapping org.
+        let blob_bank_pos = sms_asm
+            .find(".section \"data_wram_blobs\"")
+            .expect("blob section present");
+        let blob_bank_decl = sms_asm[..blob_bank_pos].rfind(".bank ").unwrap();
+        let blob_bank_line = &sms_asm[blob_bank_decl..blob_bank_pos];
+        assert!(
+            blob_bank_line.contains(&format!(".bank {} slot 2", asset_base + 1)),
+            "blob section bank line: {blob_bank_line}"
+        );
+        assert!(
+            blob_bank_line.contains(".org $1000"),
+            "blob org must clear palette/nametable and the maps: {blob_bank_line}"
+        );
+        // No section may reference a bank at/above the ROM capacity.
+        for line in sms_asm.lines() {
+            if let Some(tail) = line.trim_start().strip_prefix(".bank ")
+                && let Some(num) = tail.split_whitespace().next()
+                && let Ok(bank) = num.parse::<u32>()
+            {
+                assert!(
+                    bank < cfg.rom_kib / 16,
+                    "bank {bank} exceeds rom capacity {}",
+                    cfg.rom_kib / 16
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_mmc3_oversized_wram_blob_fails_closed() {
+        // A blob image that does not fit the packed-bank window
+        // (PACKED_WRAM_BLOB_OFFSET..PACKED_CHR_MAPS_OFFSET) must fail at
+        // emit time, never silently overlap palette/maps.
+        let mut cfg = minimal_cfg();
+        cfg.mapper = 4;
+        cfg.mmc3_prg_half_count = Some(32);
+        cfg.mmc3_chr_count = Some(128);
+        cfg.rom_kib = (MMC3_CHR_BASE + 16 + 2 + 8) * 16;
+        let mut assets = minimal_assets();
+        assets.mmc3_prg_pairs = Some(vec![vec![0u8; 0x4000]; 16]);
+        assets.mmc3_chr_groups = Some(vec![vec![0u8; 0x4000]; 16]);
+        assets.chr_nes = Some(vec![0u8; 0x20000]);
+        assets.prg_high = Some(vec![0u8; 0x4000]);
+        assets.wram_blobs = vec![WramBlobAsset {
+            dest: 0x6000,
+            bytes: vec![0u8; 0x2000],
+        }];
+
+        let build = minimal_build();
+        let err = emit_project(
+            &unique_dir("sms_proj_blob_overflow"),
+            &build,
+            &assets,
+            &cfg,
+            None,
+        )
+        .expect_err("oversized blob must fail closed");
+        assert!(
+            matches!(err, EmitError::InvalidUxromConfig(_)),
+            "unexpected error: {err:?}"
+        );
     }
 
     #[test]

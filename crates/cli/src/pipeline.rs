@@ -2468,6 +2468,8 @@ pub fn run(args: &Args) -> Result<String, Error> {
         image.chr.to_vec()
     });
 
+    // Compact MMC3 image sizing needs the group count after the move below.
+    let mmc3_group_count = mmc3_chr_groups.as_ref().map(Vec::len).unwrap_or(0) as u32;
     let project_assets = ProjectAssets {
         chr_4bpp,
         palette,
@@ -2517,15 +2519,16 @@ pub fn run(args: &Args) -> Result<String, Error> {
         // 512 KiB for everything: NROM translated uses banks 4-23;
         // banked carts use translated 4-16 + PRG data 17-24 + assets
         // 25-31 (1 MiB ROMs rendered black on real emulators).
-        // MMC3 base 1 MiB holds translated 4-20, PRG pairs 21-36, CHR
-        // groups 37-52, and the 8 packed asset banks 53-60. The full raw
-        // CHR for the banked $2007 pattern reader needs ceil(chr/16KiB)
-        // banks at 61+; the base image already leaves 3 spare banks
-        // (61-63). trace_sms verifies it; real-emulator 1 MiB support is a
-        // known follow-up.
+        // MMC3 compact layout (see the MMC3 layout note at
+        // sms_project::MMC3_PRG_BASE): translated code, PRG pairs at
+        // MMC3_PRG_BASE, converted CHR groups above, one packed small-asset
+        // bank (palette/maps/WRAM blob), then ceil(chr/16KiB) raw CHR banks
+        // for the banked $2007 pattern reader. Size the image to the exact
+        // banks used — Mednafen's SMS ceiling is 1 MiB and every spare bank
+        // is 16 KiB toward it.
         rom_kib: if mmc3 {
-            let chr_banks = image.chr.len().div_ceil(0x4000);
-            1024 + (chr_banks.saturating_sub(3) * 16) as u32
+            let chr_banks = image.chr.len().div_ceil(0x4000) as u32;
+            (sms_project::MMC3_CHR_BASE + mmc3_group_count + 2 + chr_banks) * 16
         } else {
             512
         },
