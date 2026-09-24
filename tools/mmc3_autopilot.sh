@@ -277,17 +277,18 @@ while true; do
     write_state cycles "$((cycles + 1))"
   fi
 
-  # coverage side. Free tier is the default (cheap); after 2 stall restarts
-  # escalate to the paid route for the same model (reliability).
+  # coverage side. Free tier (muse-spark-1.3-contributor-free) is the default;
+  # after 2 stall restarts fall back to opencode-go/deepseek-v4-flash (user
+  # directive — never the paid muse-spark route).
   cov_model() {
     local r; r=$(read_state coverage_restarts); r=${r:-0}
-    if [ "$r" -ge 2 ]; then echo "opencode-go/muse-spark-1.3-contributor"; fi
+    if [ "$r" -ge 2 ]; then echo "opencode-go/deepseek-v4-flash"; fi
   }
   cpid=$(read_state coverage_pid)
   if is_alive "$cpid"; then
     if ! check_stall coverage; then
       r=$(read_state coverage_restarts); r=${r:-0}; r=$(( r + 1 )); write_state coverage_restarts "$r"
-      [ "$r" -ge 2 ] && log "coverage stalled ${r}x -> escalating to PAID muse-spark"
+      [ "$r" -ge 2 ] && log "coverage stalled ${r}x -> falling back to deepseek-v4-flash"
       launch mmc3-coverage "$WT_COV" "$(continuation_prompt coverage coverage)" coverage "$(cov_model)"
     fi
   else
