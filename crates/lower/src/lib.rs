@@ -1047,7 +1047,7 @@ fn emit_value_src_to_a(p: &mut z80_emit::Program, src: &ir::ValueSrc) {
 /// This avoids a native `call rt_ppu_write` frame in SMB's deepest translated NMI
 /// chains while keeping the same RAM latch/split-scroll side effects as
 /// `runtime/ppu.s`'s `_ppu_w_scroll` body.
-fn emit_ppu_scroll_write_inline(p: &mut z80_emit::Program) {
+fn emit_ppu_scroll_write_inline(p: &mut z80_emit::Program, preserve_a: bool) {
     use sms_layout::*;
     let scroll_y = p.fresh_label("ppu_scroll_y");
     let capture_post = p.fresh_label("ppu_scroll_post");
@@ -1102,7 +1102,11 @@ fn emit_ppu_scroll_write_inline(p: &mut z80_emit::Program) {
     p.ld_abs_a(PPUADDR_TOGGLE);
 
     p.label(&restore_a);
-    p.ld_a_abs(PPU_WRITE_VALUE);
+    if preserve_a {
+        p.ld_a_abs(LOWER_SAVED_A);
+    } else {
+        p.ld_a_abs(PPU_WRITE_VALUE);
+    }
 }
 
 /// Inline the stackless `$2000 PPUCTRL` write path.
@@ -1117,6 +1121,7 @@ fn emit_ppu_ctrl_write_inline(
     p: &mut z80_emit::Program,
     chr_ram: bool,
     defer_sprite_registers: bool,
+    preserve_a: bool,
 ) {
     use sms_layout::*;
 
@@ -1215,7 +1220,11 @@ fn emit_ppu_ctrl_write_inline(
     p.jr(&restore_a);
     p.label(&done_no_ei);
     p.label(&restore_a);
-    p.ld_a_abs(PPU_WRITE_VALUE);
+    if preserve_a {
+        p.ld_a_abs(LOWER_SAVED_A);
+    } else {
+        p.ld_a_abs(PPU_WRITE_VALUE);
+    }
 }
 
 /// Inline the stackless `$2001 PPUMASK` write path.
@@ -1223,7 +1232,7 @@ fn emit_ppu_ctrl_write_inline(
 /// Stores the mask shadow and refreshes the deferred SMS VDP register-1 latch.
 /// The small DI/EI guard mirrors `rt_ppu_write`'s interrupt behavior without a
 /// call frame.
-fn emit_ppu_mask_write_inline(p: &mut z80_emit::Program, chr_ram: bool) {
+fn emit_ppu_mask_write_inline(p: &mut z80_emit::Program, chr_ram: bool, preserve_a: bool) {
     use sms_layout::*;
 
     let was_disabled = p.fresh_label("ppu_mask_was_disabled");
@@ -1280,7 +1289,11 @@ fn emit_ppu_mask_write_inline(p: &mut z80_emit::Program, chr_ram: bool) {
     p.jr(&restore_a);
     p.label(&done_no_ei);
     p.label(&restore_a);
-    p.ld_a_abs(PPU_WRITE_VALUE);
+    if preserve_a {
+        p.ld_a_abs(LOWER_SAVED_A);
+    } else {
+        p.ld_a_abs(PPU_WRITE_VALUE);
+    }
 }
 
 fn emit_ppu_reg1_latch_inline(p: &mut z80_emit::Program, display_done: &str, sprite_done: &str) {
@@ -1308,7 +1321,12 @@ fn emit_ppu_reg1_latch_inline(p: &mut z80_emit::Program, display_done: &str, spr
     p.ld_abs_a(PENDING_VDP_REG1);
 }
 
-fn emit_ppu_write_callless(program: &mut z80_emit::Program, reg: u8, native_calls: bool) {
+fn emit_ppu_write_callless(
+    program: &mut z80_emit::Program,
+    reg: u8,
+    native_calls: bool,
+    preserve_a: bool,
+) {
     use runtime_symbols::*;
 
     if native_calls {
@@ -1318,6 +1336,11 @@ fn emit_ppu_write_callless(program: &mut z80_emit::Program, reg: u8, native_call
         // store, no exit dispatch) and simpler.
         program.ld_b_imm(reg);
         program.call(PPU_WRITE);
+        if preserve_a {
+            // rt_ppu_write restores A from the write-value latch, which for
+            // STX/STY sources is the X/Y value, not the 6502 accumulator.
+            program.ld_a_abs(sms_layout::LOWER_SAVED_A);
+        }
         return;
     }
     let cont = program.fresh_label("ppu_write_cont");
@@ -1325,6 +1348,9 @@ fn emit_ppu_write_callless(program: &mut z80_emit::Program, reg: u8, native_call
     program.ld_hl_label(&cont);
     program.jp(PPU_WRITE_CONT);
     program.label(&cont);
+    if preserve_a {
+        program.ld_a_abs(sms_layout::LOWER_SAVED_A);
+    }
 }
 
 /// Inline the stackless `$2002 PPUSTATUS` read path.
@@ -5305,6 +5331,15 @@ pub fn lower_routine(
             // Hardware ops
             // ------------------------------------------------------------------
             Op::PpuWrite { reg, value } => {
+                // STX/STY to a PPU register must not clobber the 6502
+                // accumulator: the write helpers restore A from the
+                // write-value latch ($CB18), which holds the X/Y value for
+                // these sources. Spill A to the IRQ-safe lowerer byte and
+                // restore it after the write completes.
+                let preserve_a = !matches!(value, ir::ValueSrc::A);
+                if preserve_a {
+                    program.ld_abs_a(sms_layout::LOWER_SAVED_A);
+                }
                 emit_value_src_to_a(program, value);
                 match *reg {
                     0 => {
@@ -5312,17 +5347,18 @@ pub fn lower_routine(
                         let deferred = opts
                             .profile
                             .is_some_and(|p| p.translation.defer_sprite_registers);
-                        emit_ppu_ctrl_write_inline(program, chr_ram, deferred);
+                        emit_ppu_ctrl_write_inline(program, chr_ram, deferred, preserve_a);
                     }
                     1 => {
                         let chr_ram = opts.profile.map(|p| p.rom.chr_kib == 0).unwrap_or(false);
-                        emit_ppu_mask_write_inline(program, chr_ram);
+                        emit_ppu_mask_write_inline(program, chr_ram, preserve_a);
                     }
-                    5 => emit_ppu_scroll_write_inline(program),
+                    5 => emit_ppu_scroll_write_inline(program, preserve_a),
                     _ => emit_ppu_write_callless(
                         program,
                         *reg,
                         opts.profile.is_some_and(|p| p.native_calls()),
+                        preserve_a,
                     ),
                 }
             }
@@ -5340,17 +5376,34 @@ pub fn lower_routine(
             }
 
             Op::OamDmaWrite { value } => {
+                // STX/STY $4014: rt_oam_dma consumes A as the DMA page, so
+                // the 6502 accumulator must survive the X/Y load.
+                let preserve_a = !matches!(value, ir::ValueSrc::A);
+                if preserve_a {
+                    program.ld_abs_a(sms_layout::LOWER_SAVED_A);
+                }
                 emit_value_src_to_a(program, value);
                 program.call(OAM_DMA);
+                if preserve_a {
+                    program.ld_a_abs(sms_layout::LOWER_SAVED_A);
+                }
             }
 
             Op::ApuWrite { reg, value } => {
+                // STX/STY to an APU register must preserve the 6502 A.
+                let preserve_a = !matches!(value, ir::ValueSrc::A);
+                if preserve_a {
+                    program.ld_abs_a(sms_layout::LOWER_SAVED_A);
+                }
                 emit_value_src_to_a(program, value);
                 if *reg == 0x4016 {
                     program.call(CONTROLLER_STROBE);
                 } else {
                     program.ld_hl_imm(*reg);
                     program.call(APU_WRITE);
+                }
+                if preserve_a {
+                    program.ld_a_abs(sms_layout::LOWER_SAVED_A);
                 }
             }
 
@@ -5381,9 +5434,17 @@ pub fn lower_routine(
             }
 
             Op::MapperWrite { addr, value } => {
+                // STX/STY to a mapper register must preserve the 6502 A.
+                let preserve_a = !matches!(value, ir::ValueSrc::A);
+                if preserve_a {
+                    program.ld_abs_a(sms_layout::LOWER_SAVED_A);
+                }
                 emit_value_src_to_a(program, value);
                 program.ld_hl_imm(*addr);
                 program.call(MAPPER_WRITE);
+                if preserve_a {
+                    program.ld_a_abs(sms_layout::LOWER_SAVED_A);
+                }
             }
         }
     }
@@ -5669,7 +5730,7 @@ mod tests {
         define_runtime_stubs(&mut prog);
         prog.org(0x0000);
         prog.section("test");
-        emit_ppu_ctrl_write_inline(&mut prog, chr_ram, false);
+        emit_ppu_ctrl_write_inline(&mut prog, chr_ram, false, false);
         prog.finish().unwrap().asm
     }
 
@@ -6035,6 +6096,76 @@ chr_kib = 0
         assert!(build.asm.contains("ld a,($CA18)"));
         assert!(build.asm.contains("cp $40"));
         assert!(build.asm.contains("ld ($CA18),a"));
+    }
+
+    #[test]
+    fn ppu_write_reg3_stx_preserves_a_for_following_dma() {
+        // Mother NMI: `LDA #$02; STX $2003; STA $4014`. The STX must not
+        // clobber the 6502 accumulator, or rt_oam_dma copies page 0 (ZP)
+        // instead of page $02 (OAM) and the SAT renders garbage sprites.
+        let build = lower_and_finish(vec![
+            Op::PpuWrite {
+                reg: 3,
+                value: ValueSrc::X,
+            },
+            Op::OamDmaWrite { value: ValueSrc::A },
+        ]);
+        // spill before the X load, restore after the continuation
+        assert!(build.asm.contains("ld ($CB27),a"));
+        assert!(build.asm.contains("ld a,($CB27)"));
+        // the restore must come after the DMA call
+        let dma = build.asm.find("call rt_oam_dma").expect("dma call");
+        let restore = build.asm.rfind("ld a,($CB27)").expect("restore");
+        assert!(
+            restore < dma,
+            "A restore must precede the DMA call so the page is the 6502 A"
+        );
+        // and the spill must precede the X load
+        let spill = build.asm.find("ld ($CB27),a").expect("spill");
+        let xload = build.asm.find("ld a,d").expect("x load");
+        assert!(spill < xload, "A spill must precede the X load");
+    }
+
+    #[test]
+    fn ppu_write_reg3_stx_preserves_a_stackless_cont() {
+        // Stackless continuation path: the restore lands at the continuation
+        // label, after rt_ppu_write_cont returns via jp (hl).
+        let build = lower_and_finish(vec![Op::PpuWrite {
+            reg: 3,
+            value: ValueSrc::X,
+        }]);
+        assert!(build.asm.contains("jp rt_ppu_write_cont"));
+        assert!(build.asm.contains("ld ($CB27),a"));
+        assert!(build.asm.contains("ld a,($CB27)"));
+        let cont = build.asm.find("ppu_write_cont:").expect("cont label");
+        let restore = build.asm.find("ld a,($CB27)").expect("restore");
+        assert!(
+            restore > cont,
+            "A restore must follow the continuation label"
+        );
+    }
+
+    #[test]
+    fn ppu_write_reg0_sta_does_not_spill() {
+        // STA $2000 (value = A) needs no spill: the inline path already
+        // restores A from the write-value latch.
+        let build = lower_and_finish(vec![Op::PpuWrite {
+            reg: 0,
+            value: ValueSrc::A,
+        }]);
+        assert!(!build.asm.contains("ld ($CB27),a"));
+    }
+
+    #[test]
+    fn oam_dma_stx_preserves_a() {
+        // STX $4014: rt_oam_dma consumes A as the page; the 6502 A must
+        // survive the X load.
+        let build = lower_and_finish(vec![Op::OamDmaWrite { value: ValueSrc::X }]);
+        assert!(build.asm.contains("ld ($CB27),a"));
+        assert!(build.asm.contains("ld a,($CB27)"));
+        let dma = build.asm.find("call rt_oam_dma").expect("dma call");
+        let restore = build.asm.rfind("ld a,($CB27)").expect("restore");
+        assert!(restore > dma);
     }
 
     #[test]
