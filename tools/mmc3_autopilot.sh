@@ -4,7 +4,8 @@
 # It does NOT make domain decisions. It performs only the mechanical
 # handoffs the orchestrator would otherwise repeat by hand:
 #   * detect MMC3:-prefixed commits on mmc3/debug-trap-triage, merge them
-#     into mmc3/wip, run the gate set, refresh checkpoint tag + bundle;
+#     into mmc3/wip, run the gate set, push mmc3/wip to GitHub, refresh
+#     checkpoint tag + bundle;
 #   * when a session exits, preserve uncommitted work on a rescue branch
 #     (never merged), then relaunch the session with a continuation prompt
 #     built from its own last report;
@@ -13,7 +14,9 @@
 #   * detect stalled sessions (log + CPU frozen) and restart them;
 #   * hard-stop on merge conflict, red gate, or the cycle cap.
 #
-# Never: git push, force, history rewrite, or auto-edit profiles/**.
+# Never: force, history rewrite, or auto-edit profiles/**.
+# Push policy (user standing order): every successful wip merge is pushed
+# to origin/mmc3/wip immediately; a failed push hard-stops the loop.
 #
 # Usage:  MM3_MODE=dry-run tools/mmc3_autopilot.sh   # one evaluation pass, no launches
 #         tools/mmc3_autopilot.sh                    # live loop
@@ -98,6 +101,9 @@ merge_debug() {
   fi
   if ! run_gates; then
     log "STOP: red gate after merging debug"; return 3
+  fi
+  if ! git push origin mmc3/wip >>"$LOG" 2>&1; then
+    log "STOP: push failed (wip -> origin); manual push required"; return 4
   fi
   refresh_backup
   write_state debug_base "$(git -C "$MAIN" rev-parse "$DBG_BRANCH")"
@@ -255,7 +261,7 @@ while true; do
 
   # debug side
   if merge_debug; then :; else
-    log "stopping: debug merge/gate failure"; exit 2
+    log "stopping: debug merge/gate/push failure"; exit 2
   fi
   dpid=$(read_state debug_pid)
   if is_alive "$dpid"; then
