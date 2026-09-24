@@ -679,8 +679,13 @@ impl oracle_6502::Bus for NesBus {
                     // subject's uploaded tiles can be compared against
                     // ground truth (FD_DUMP_CHRRAM).
                     let a = self.ppu_addr & 0x3FFF;
-                    if (0x2000..0x3000).contains(&a)
-                        && self.ppu_log_values.contains(&value)
+                    // Palette-space writes ($3F00-$3FFF) always log when any
+                    // FD_LOG_PPU_VALUES filter is set: palette cycling (title
+                    // fades, globe glow) lives here and RAM parity can't see it.
+                    let pal_write =
+                        (0x3F00..0x4000).contains(&a) && !self.ppu_log_values.is_empty();
+                    if ((0x2000..0x3000).contains(&a) && self.ppu_log_values.contains(&value)
+                        || pal_write)
                         && self.ppu_log_count < self.ppu_log_limit
                     {
                         eprintln!(
@@ -708,6 +713,20 @@ impl oracle_6502::Bus for NesBus {
                     // Writes advance the VRAM address like reads do.
                     let inc = if self.ppu_ctrl & 0x04 != 0 { 32 } else { 1 };
                     self.ppu_addr = self.ppu_addr.wrapping_add(inc);
+                }
+                // $2003/$2004 (OAMADDR/OAMDATA) manual sprite writes are
+                // otherwise unmodeled: log them under FD_DMA_LOG so sprite
+                // sources outside $0200-DMA stay visible.
+                if (reg == 0x2003 || reg == 0x2004) && std::env::var("FD_DMA_LOG").is_ok() {
+                    eprintln!(
+                        "REF_OAM frame={} bank={} pc=${:04X} reg=${:04X} value=${:02X}",
+                        self.current_frame
+                            .map_or_else(|| "pre".to_string(), |frame| frame.to_string()),
+                        self.current_exec_bank(),
+                        self.last_pc,
+                        reg,
+                        value,
+                    );
                 }
                 if reg == 0x2005 && !self.addr_latch_toggle {
                     self.scroll_x_last = value;
@@ -742,6 +761,20 @@ impl oracle_6502::Bus for NesBus {
             0x4014 => {
                 // OAM DMA: copies page (value<<8) to OAM. No effect on
                 // $0000-$07FF game RAM, so skip for the comparison.
+                // FD_DMA_LOG=1 records source page + timing: sprite
+                // animation via DMA from a non-$0200 page is invisible to
+                // FD_DUMP_SPRITES and the reference renderer (both read
+                // $0200), so this is the only way to see it.
+                if std::env::var("FD_DMA_LOG").is_ok() {
+                    eprintln!(
+                        "REF_DMA frame={} bank={} pc=${:04X} page=${:02X}00",
+                        self.current_frame
+                            .map_or_else(|| "pre".to_string(), |frame| frame.to_string()),
+                        self.current_exec_bank(),
+                        self.last_pc,
+                        value,
+                    );
+                }
             }
             0x4016 => {
                 let new_strobe = value & 1 != 0;
@@ -1483,12 +1516,25 @@ fn run_reference(
         }
         if mmc3_dump_path.is_some() {
             let r = bus.mmc3.regs;
+            // FNV-1a over palette RAM: palette-cycling animation (which RAM
+            // parity cannot see) shows up as a periodic hash rotation.
+            let mut pal_hash: u32 = 0x811c_9dc5;
+            for b in bus.palette_ram {
+                pal_hash ^= b as u32;
+                pal_hash = pal_hash.wrapping_mul(0x0100_0193);
+            }
             mmc3_dump_lines.push(format!(
-                "{frame} sel={:02X} R0={:02X} R1={:02X} R2={:02X} R3={:02X} R4={:02X} R5={:02X} R6={:02X} R7={:02X} mir={} ppu_ctrl={:02X}",
+                "{frame} sel={:02X} R0={:02X} R1={:02X} R2={:02X} R3={:02X} R4={:02X} R5={:02X} R6={:02X} R7={:02X} mir={} ppu_ctrl={:02X} mask={:02X} scroll={:02X} pal={:08X} irq_lat={:02X} irq_en={} irq_ctr={:02X}",
                 bus.mmc3.bank_select,
                 r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7],
                 if bus.mmc3.horizontal_mirroring { "H" } else { "V" },
-                bus.ppu_ctrl
+                bus.ppu_ctrl,
+                bus.ppu_mask,
+                bus.scroll_x_last,
+                pal_hash,
+                bus.mmc3.irq_latch,
+                bus.mmc3.irq_enabled as u8,
+                bus.mmc3.irq_counter
             ));
         }
         snaps.push(bus.ram);
@@ -1642,6 +1688,17 @@ impl SmsBus {
     fn vdp_hash(&self) -> u64 {
         let mut h: u64 = 0xcbf29ce484222325;
         for &b in self.vram.iter().chain(self.cram.iter()) {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        h
+    }
+    /// CRAM-only FNV hash (FD_CRAM_DUMP): isolates palette traffic (title
+    /// fades, palette cycling) from per-frame VRAM churn (SAT/scroll
+    /// streaming) that drowns the combined vdp_hash.
+    fn cram_hash(&self) -> u64 {
+        let mut h: u64 = 0xcbf29ce484222325;
+        for &b in self.cram.iter() {
             h ^= b as u64;
             h = h.wrapping_mul(0x100000001b3);
         }
@@ -2318,6 +2375,12 @@ fn run_subject(
         })
     });
     let mut vdp_hashes: Vec<u64> = Vec::new();
+    // FD_CRAM_DUMP=<file>: record a per-frame FNV hash of CRAM only.
+    let cram_dump: Option<String> = std::env::var("FD_CRAM_DUMP").ok();
+    let mut cram_hashes: Vec<u64> = Vec::new();
+    // Raw per-frame CRAM copies for value-level checks (FD_CRAM_DUMP=*.bin).
+    let cram_raw = cram_dump.as_deref().is_some_and(|p| p.ends_with(".bin"));
+    let mut cram_frames: Vec<[u8; 32]> = Vec::new();
     let mut gbv_allocs_steady: u64 = 0;
     let gbv_alloc_pc: Option<u16> = sym_path
         .as_ref()
@@ -2450,6 +2513,29 @@ fn run_subject(
         snaps.push(snap_nes_ram(&bus));
         if vdp_dump.is_some() || vdp_check.is_some() {
             vdp_hashes.push(bus.vdp_hash());
+        }
+        if cram_dump.is_some() {
+            cram_hashes.push(bus.cram_hash());
+            if cram_raw {
+                cram_frames.push(bus.cram);
+            }
+        }
+    }
+    if let Some(path) = &cram_dump {
+        if cram_raw {
+            let raw: Vec<u8> = cram_frames.iter().flatten().copied().collect();
+            let _ = std::fs::write(path, raw);
+            eprintln!(
+                "  [cram] dumped {} per-frame raw CRAM frames",
+                cram_frames.len()
+            );
+        } else {
+            let text: String = cram_hashes.iter().map(|h| format!("{h:016x}\n")).collect();
+            let _ = std::fs::write(path, text);
+            eprintln!(
+                "  [cram] dumped {} per-frame CRAM hashes",
+                cram_hashes.len()
+            );
         }
     }
     if let Some(path) = &vdp_dump {
