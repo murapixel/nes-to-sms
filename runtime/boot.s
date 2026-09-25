@@ -65,6 +65,10 @@
 ;   $CA19-$CA1C Slot-2 guard frame 0: IFF2, $FFFC, $FFFF, $CB62
 ;   $CA1D-$CA1F/$D3FF Slot-2 guard frame 1: IFF2, $FFFC, $FFFF, $CB62
 ;   $D3FC-$D3FE  PPU continuation pointer/mode; $D3FF is guard frame-1 CB62
+;   $D400-$D43F  MMC3 dynamic sprite tile keys (sat.s; CHR-ROM-unused resolve area)
+;   $D440-$D447  MMC3 sprite bank fingerprint: R0-R5 + PPUCTRL bits + valid
+;                (sat.s; CHR-ROM-unused variant-key area)
+;   $D480-$D4BF  MMC3 dynamic sprite attr keys (sat.s; unreferenced elsewhere)
 ;   $D4C0-$D4FF  Far slot-1 bank/continuation stack entries (dispatch.s)
 ;   $DD80-$DE3F  BG variant ring-slot NT refcounts (chrmap.s BGV_REFCNT;
 ;                below the native stack: SP low-water measured $DFC4)
@@ -109,6 +113,17 @@
 .define MMC3_PRG_LOW $CB70
 .define MMC3_PRG_HIGH $CB71
 .define MMC3_CHR_DIRTY $CB72
+; MMC3 dynamic sprite window keys (sat.s). Plain numbers, zero cost to other
+; builds; boot.s precedes every user. These reuse CHR-ROM-unused areas: the
+; $D400 resolve table (rt_sat_resolve never runs without NES_CHR_RAM), the
+; $D440 variant keys (variant_get_scratch is bypassed on MMC3), and $D480
+; (defined but unreferenced). Mutually exclusive with the CHR-RAM pair cache
+; ($D400/$D480) and CV1's $D440 cursor by construction (NES_MMC3 forbids
+; NES_CHR_RAM; CV1 is mapper 2).
+.define MMC3_SPR_TILE_KEYS $D400
+.define MMC3_SPR_ATTR_KEYS $D480
+.define MMC3_SPR_FP $D440
+.define MMC3_SPR_FP_VALID $D447
 .ifdef CV1_RUNTIME_HOOKS
 .define RT_CV1_VBUF_ACTIVE      $FA   ; dormant C800 header must stay zero
 .endif
@@ -443,6 +458,10 @@ boot_main:
   ; 0, HIGH = half 1, IRQ off). Translated reset code assumes the reference
   ; power-on mapping from the first instruction.
   call rt_mmc3_reset
+  xor a
+  ld  (MMC3_SPR_FP_VALID), a ; sprite fingerprint invalid: first SAT upload
+                             ; bulk-generates the dynamic window from the
+                             ; live banks (see sat.s Phase 0)
 .ifdef WRAM_BLOB_COUNT
   ; Seed static WRAM code blobs into SMS EXRAM (mapper_mmc3.s).
   call rt_wram_blob_seed
