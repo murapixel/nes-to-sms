@@ -258,6 +258,54 @@ name = "FuncD628"
 addr = 0xE09C
 name = "FuncE09C"
 
+# Prologue-printer tail cluster, fixed bank 31 ($E000-$FFFF): the 30f-tap
+# overworld route (route_4f.txt as FD_PAD_RAW + FD_PAUSE_START=1,
+# FD_PAUSE_AT=1100,1850,2150,2450,2750,3050) first diverges at frame 5461
+# ($0031/$0032/$0036/$003E/$0069) because the reference executes this
+# cluster and the subject cannot: none of $E745-$E820 (except $E739-$E744)
+# has any static JSR/JMP referent in the 256 KiB PRG (whole-image scan;
+# the only cross-refs are bank19->{E72A,E739,E785,E78D} and bank31-internal
+# ones), so the analyzer never lifts it and the subject's JMP ($007C)
+# transfer targeting it misses. Reference evidence (FD_TRACE_PC, same
+# route): frame=5461/5470 bank=31 pc=$E804 (A=$00 X=$00 Y=$06),
+# pc=$E7FE (A=$FD: JSR $E6F2 returns carry-set, immediate RTS), pc=$E812
+# (A=$46 X=$04 Y=$1B via the $E765 block; A=$30/$86 X=$00 Y=$0F via the
+# $E778 block). Miss proof: the subject visibly executes $ED49 instead --
+# the next lifted fixed boundary >= any cluster entry (page-E7 table holds
+# only $E739): ROM $EDD6-$EDDF = 05 EE 45 EE 05 EE 7E EE 00 00 lands
+# byte-identical in subject $0540-$0548 at frame 5477, plus $7C->$0040-43
+# ($ED64) and $80->$07EF ($ED5F) -- the _btd_miss silent-realignment
+# pattern from the $C9F9->$CA19 precedent, not a trap (fail-open realign
+# for fixed targets). All five entries are clean routine starts
+# (byte-verified below); the walks from them are closed (JSR callees
+# $E725/$E72A/$E785/$E817/$E821/$E82A/$E67F/$E6F2 all end RTS; data reads
+# $ED41/$7600 touch ROM/RAM only). No bank numbers: fixed window.
+# $E745 = 20 25 E7 (JSR $E725).
+# $E75C = A0 1B (LDY #$1B).
+# $E765 = A0 15 (LDY #$15).
+# $E778 = 20 39 E7 (JSR $E739).
+# $E7FE = 20 F2 E6 (JSR $E6F2).
+
+[[function]]
+addr = 0xE745
+name = "PrologueE745"
+
+[[function]]
+addr = 0xE75C
+name = "PrologueE75C"
+
+[[function]]
+addr = 0xE765
+name = "PrologueE765"
+
+[[function]]
+addr = 0xE778
+name = "PrologueE778"
+
+[[function]]
+addr = 0xE7FE
+name = "PrologueE7FE"
+
 # (Deadlock-diagnostic stubs REMOVED 2026-09-08: testing faithful boot with
 # DIAG_DELAYNMI head-start instead. Re-add only if faithful path deadlocks.)
 
