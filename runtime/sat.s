@@ -39,6 +39,24 @@
 ; $0000 and could corrupt unrelated VRAM). A future base-aware allocator can
 ; reserve a safe $0000-base scratch window and re-enable variants there.
 ;
+; ── MMC3 dynamic sprite window ──────────────────────────────────────────
+; CHR-ROM NROM packs sprite patterns statically (data_chr + maps), but an MMC3
+; game bank-switches the sprite pattern table (R0-R5 + PPUCTRL bit 3), so no
+; static slot stays correct past the next CHR write. On NES_MMC3 builds every
+; OAM entry therefore owns relative slot == entry index (absolute 256+index,
+; VRAM $2000+index*32, VDP base $2000 — forced by the ppu.s PPUCTRL mirror),
+; generated from the LIVE 1 KiB bank on first use and regenerated whenever its
+; key changes. Keys: OAM tile per entry ($D400) + attr&$C3 per entry ($D480);
+; banks/table form a per-frame fingerprint ($D440: R0-R5 + PPUCTRL bits 5,3 +
+; valid). A fingerprint change regenerates every visible entry (bulk path);
+; otherwise only entries whose tile/attr changed regenerate (OAM-swap
+; animation). $D400/$D480/$D440 are CHR-ROM-unused resolve/variant-key areas
+; (rt_sat_resolve and variant_get_scratch never run on MMC3 builds). Hidden
+; entries (Y>=$CF) keep stale keys — compaction skips them, and any later
+; tile/attr/bank change regenerates before upload. Attribute/palette/flip
+; handling is baked at generation (do_sprite_variant's converter core reads
+; the live group bank), so the 16-slot scratch pool is bypassed on MMC3.
+;
 ; RAM scratch:
 ;   $D400-$D43F  resolved SMS tile number per sprite (64 bytes)
 ;   $D440-$D44F  variant cache mapped-tile keys (16 bytes)
@@ -71,7 +89,9 @@
 ; during presentation at depth 0 with IFF disabled after the boot boundary
 ; assertion. rt_restore_prg_window is the locked restore primitive.
 ; do_sprite_variant must not acquire its own guard or wrapper: that would deepen
-; this stack-sensitive private path.
+; this stack-sensitive private path. The MMC3 dynamic window extends the chain
+; as boot presentation -> rt_sat_upload -> _mmc3_sat_sync -> _msf_gen ->
+; do_sprite_variant (same lock, group-bank map instead of data_chr).
 ;
 ; CHR-RAM 8x16 sprites are resolved per OAM entry into SMS slots 0..127.
 
@@ -188,6 +208,12 @@ do_sprite_variant:
   ld   hl, $cb63
   ld   (SAT_VARIANT_SRC), hl
 .else
+.ifdef NES_MMC3
+  ; Banked sprite source: the caller mapped the live CHR group bank and parked
+  ; the tile's converted address in SAT_VARIANT_SRC. Static data_chr only holds
+  ; the power-on 8 KiB and goes stale at the first CHR write, so it is never
+  ; read here.
+.else
   ; source base in ROM = data_chr ($8000) + (256 + C)*32 = $A000 + C*32
   ld   l, c
   ld   h, $00
@@ -200,11 +226,25 @@ do_sprite_variant:
   add  hl, de
   ld   (SAT_VARIANT_SRC), hl
 .endif
+.endif
 
   ; CV1's shared dynamic cache owns $2000 + slot*64 in both sprite sizes.
   ; Its 8x8 path uses this exact converter, not stale base copy-through.
   ; Other profiles retain the original 16-slot variant destination.
-  pop  af                    ; scratch index
+  pop  af                    ; scratch index (MMC3: dynamic entry index)
+.ifdef NES_MMC3
+  ; Dynamic window slot == OAM entry: dest = $2000 + entry*32. The VDP sprite
+  ; base is $2000 on MMC3 builds (ppu.s forces it), so the SAT tile byte for
+  ; an entry is just its index (sat.s Phase 0).
+  ld   l, a
+  ld   h, $00
+  add  hl, hl
+  add  hl, hl
+  add  hl, hl
+  add  hl, hl
+  add  hl, hl                ; entry * 32
+  ld   de, $2000
+.else
 .ifdef CV1_RUNTIME_HOOKS
   ld   a, (CV1_SAT_SLOT)
 .endif
@@ -221,6 +261,7 @@ do_sprite_variant:
 .else
   ld   de, $3500
 .endif
+.endif
   add  hl, de
   ld   a, l
   out  ($bf), a
@@ -230,9 +271,13 @@ do_sprite_variant:
 
   ; Map the static CHR asset for CHR-ROM builds. CHR-RAM variants read the
   ; staged planar bytes above and leave the current PRG window visible.
+  ; MMC3 builds keep the caller-mapped live CHR group bank (static data_chr
+  ; only holds the power-on 8 KiB).
 .ifndef NES_CHR_RAM
+.ifndef NES_MMC3
   ld   a, :data_chr
   ld   ($ffff), a
+.endif
 .endif
 
   ld   b, 8                  ; rows remaining
@@ -606,6 +651,213 @@ _res16_next:
   ret
 .endif
 
+; ─── MMC3 dynamic sprite window sync ──────────────────────────────────────
+; Phase 0 of rt_sat_upload on NES_MMC3 builds: resolve every OAM entry into its
+; owned relative slot (slot == entry index, absolute 256+index at VDP base
+; $2000), generating the pattern from the LIVE CHR 1 KiB bank on first use and
+; regenerating whenever the entry key changes. Entry: none (walks $C900).
+; Clobbers AF, BC, DE, HL and a bounded stack slice; restores the current PRG
+; window after each generation. Locked-only transitively through
+; rt_mmc3_chr_1k/do_sprite_variant: same presentation/outer-guard contexts as
+; rt_sat_upload itself.
+; Key storage (CHR-ROM-unused on MMC3): tile per entry at MMC3_SPR_TILE_KEYS
+; ($D400), attr&$C3 per entry at MMC3_SPR_ATTR_KEYS ($D480), bank fingerprint
+; at MMC3_SPR_FP ($D440: R0-R5 + PPUCTRL bits 5,3 + valid flag $D447).
+.ifdef NES_MMC3
+_mmc3_sat_sync:
+  ; Fingerprint: R0-R5, then PPUCTRL bits 5,3, then valid. Any mismatch takes
+  ; the bulk path (regenerate every visible entry + store the fingerprint).
+  ld   hl, MMC3_R0
+  ld   de, MMC3_SPR_FP
+  ld   b, 6
+_msf_fp_cmp:
+  ld   a, (de)
+  cp   (hl)
+  jr   nz, _msf_bulk
+  inc  hl
+  inc  de
+  djnz _msf_fp_cmp
+  ld   a, ($cb08)
+  and  $28                   ; PPUCTRL bits 5 (8x16, degrades as 8x8) and 3
+  ld   c, a
+  ld   a, (de)
+  cp   c
+  jr   nz, _msf_bulk
+  inc  de
+  ld   a, (de)
+  or   a
+  jr   z, _msf_bulk
+  ; Incremental path: regenerate only entries whose tile/attr changed.
+  ld   hl, $c900
+  ld   b, 64                  ; B = entries remaining
+  ld   d, $00                 ; D = entry index
+_msf_incr:
+  ld   a, (hl)               ; raw NES Y
+  cp   $cf
+  jr   nc, _msf_inext
+  inc  l
+  ld   c, (hl)               ; C = OAM tile
+  inc  l
+  ld   a, (hl)
+  and  $c3                   ; palette bits + H/V flip; ignore priority
+  ld   e, a                  ; E = attr key
+  dec  l
+  dec  l                     ; HL back at the entry's Y byte
+  ld   a, d
+  ld   h, $d4
+  ld   l, a                  ; HL = $D400+index (OAM ptr recovered from D)
+  ld   a, (hl)
+  cp   c
+  jr   nz, _msf_imiss
+  set  7, l                  ; HL = $D480+index
+  ld   a, (hl)
+  cp   e
+  jr   nz, _msf_imiss
+  ld   a, d                  ; hit: recover the OAM pointer
+  add  a, a
+  add  a, a
+  ld   l, a
+  ld   h, $c9
+  jr   _msf_inext
+_msf_imiss:
+  ld   a, d                  ; recover the OAM pointer, then regenerate
+  add  a, a
+  add  a, a
+  ld   l, a
+  ld   h, $c9
+  call _msf_gen              ; D = index, HL = OAM Y (B, C, H, L preserved)
+  ld   a, l
+  srl  a
+  srl  a
+  ld   d, a                  ; D = index (gen preserves H, L)
+_msf_inext:
+  ld   a, l
+  add  a, $04
+  ld   l, a
+  inc  d
+  djnz _msf_incr
+  ret
+_msf_bulk:
+  ; Bulk path: regenerate every visible entry, then store the fingerprint.
+  ld   hl, $c900
+  ld   b, 64
+  ld   d, $00
+_msf_bloop:
+  ld   a, (hl)
+  cp   $cf
+  jr   nc, _msf_bnext
+  call _msf_gen              ; D = index, HL = OAM Y (B, C, H, L preserved)
+  ld   a, l
+  srl  a
+  srl  a
+  ld   d, a
+_msf_bnext:
+  ld   a, l
+  add  a, $04
+  ld   l, a
+  inc  d
+  djnz _msf_bloop
+  ld   hl, MMC3_R0
+  ld   de, MMC3_SPR_FP
+  ld   bc, 6
+  ldir                       ; R0-R5 -> fingerprint
+  ld   a, ($cb08)
+  and  $28
+  ld   (de), a               ; PPUCTRL bits 5,3
+  inc  de
+  ld   a, $01
+  ld   (de), a               ; valid
+  ret
+
+; Generate entry D's owned slot from the live CHR bank.
+; Entry: D = OAM index (0..63), HL -> the entry's OAM Y byte ($C900 page).
+; Preserves B, C, H, L (caller loop state); clobbers A, D, E and a bounded
+; stack slice. Updates the entry's tile/attr keys. Restores slot 2 via
+; rt_restore_prg_window (through do_sprite_variant's tail).
+_msf_gen:
+  push bc
+  push hl                    ; OAM Y pointer
+  push de                    ; entry index
+  inc  l
+  ld   a, (hl)
+  ld   (SAT_VARIANT_TILE), a ; T
+  inc  l
+  ld   a, (hl)
+  and  $c3
+  ld   (SAT_VARIANT_ATTR), a ; attr key
+  ; 1 KiB slot = sprite-table*4 + T>>6. Table from PPUCTRL bit 3 (8x8; an
+  ; 8x16 sprite table bit degrades exactly like the NROM static path, which
+  ; also keys off PPUCTRL bit 3).
+  ld   a, ($cb08)
+  and  $08
+  rrca
+  rrca
+  rrca                       ; $08 -> $01
+  rlca
+  rlca                       ; table*4
+  ld   b, a
+  ld   a, (SAT_VARIANT_TILE)
+  rlca
+  rlca
+  and  $03                   ; T>>6 (rotate LEFT: original bits 7,6 land low)
+  or   b
+  call rt_mmc3_chr_1k        ; A = live chr1k bank (clobbers AF, BC, DE, HL)
+  ld   b, a                  ; B = chr1k
+  ; Source = group bank NES_MMC3_CHR_BASE + (K>>3) at slot 2, offset
+  ; ((K&7)<<11) + ((T&63)<<5) — the same (bank, tile) -> address rule as
+  ; rt_bg_gen_variant's MMC3 branch, so BG and sprite pixels never drift.
+  and  $07
+  add  a, a
+  add  a, a
+  add  a, a                  ; (K&7)<<3
+  ld   e, a                  ; E = bank part of H
+  ld   a, (SAT_VARIANT_TILE)
+  and  $3f
+  srl  a
+  srl  a
+  srl  a                     ; (T&63)>>3
+  add  a, e
+  add  a, $80
+  ld   h, a                  ; H (slot-2 base $8000 included)
+  ld   a, (SAT_VARIANT_TILE)
+  and  $3f
+  add  a, a
+  add  a, a
+  add  a, a
+  add  a, a
+  add  a, a                  ; ((T&63)<<5) low byte
+  ld   l, a
+  ld   a, b
+  srl  a
+  srl  a
+  srl  a                     ; K>>3 (group)
+  add  a, NES_MMC3_CHR_BASE
+  ld   ($ffff), a            ; map the live group bank
+  ld   (SAT_VARIANT_SRC), hl
+  pop  de                    ; D = entry index
+  ld   a, (SAT_VARIANT_ATTR)
+  ld   b, a                  ; B = attr key
+  ld   a, (SAT_VARIANT_TILE)
+  ld   c, a                  ; C = source tile
+  ld   a, d                  ; A = entry (dest slot)
+  call do_sprite_variant     ; converter core; restores slot 2 at its tail
+  pop  hl                    ; HL = OAM Y (preserved)
+  push hl
+  ld   a, l
+  srl  a
+  srl  a                     ; A = index (L = $00..$FC step 4)
+  ld   h, $d4
+  ld   l, a                  ; HL = $D400+index
+  ld   a, (SAT_VARIANT_TILE)
+  ld   (hl), a               ; tile key
+  set  7, l                  ; HL = $D480+index
+  ld   a, (SAT_VARIANT_ATTR)
+  ld   (hl), a               ; attr key
+  pop  hl                    ; HL = OAM Y (preserved)
+  pop  bc                    ; B = loop counter (preserved)
+  ret
+.endif
+
 ; ─── rt_sat_resolve ───────────────────────────────────────────────────────────
 ; First SAT pass: resolve each sprite's SMS tile number into $D400, performing
 ; software palette/flip variants into VRAM scratch as needed. Clobbers AF, BC,
@@ -695,6 +947,11 @@ rt_sat_upload:
   push bc
   push de
 
+.ifdef NES_MMC3
+  ; Phase 0: resolve the dynamic sprite window from the live CHR banks
+  ; before any SAT port traffic (pattern-region writes only, tear-safe).
+  call _mmc3_sat_sync
+.endif
 .ifdef NES_CHR_RAM
   call rt_sat_resolve        ; 8x16 pair resolver (CHR-ROM resolves fused
                              ; into the X/T sweep below)
@@ -781,11 +1038,22 @@ _sat_xt_loop:
   inc  l
   out  ($be), a              ; write X
   inc  d
+.ifdef NES_MMC3
+  ; Dynamic window: the SAT tile is the OAM entry index (Phase 0 generated
+  ; the live-bank pattern into slot == index). L is the X byte ($C903+4i).
+  ld   a, l
+  sub  $03
+  srl  a
+  srl  a
+  ld   c, a
+  jr   _sat_xt_out
+.else
   ld   a, c
   call rt_map_sprite_tile    ; A = mapped rel tile (preserves BC, DE, HL)
   ld   c, a
   cp   SAT_BLANK_REL
   jr   z, _sat_xt_out
+.endif
   ld   a, b
   and  $c3                   ; palette bits + H/V flip; ignore priority
   jr   z, _sat_xt_out

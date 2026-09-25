@@ -287,8 +287,16 @@ _pwc_no_8x16_latch:
   ; slots $100-$1FF, so table switches must also switch the SMS sprite base.
   bit  5, a                 ; NES 8x16 selects the table per OAM tile bit
   jr   nz, _ppu_sprite_base_2000
+.ifdef NES_MMC3
+  ; Banked sprite patterns live in the dynamic window at SMS base $2000 for
+  ; either NES table (sat.s Phase 0 generates them from the live R0-R5
+  ; banks); the base never follows PPUCTRL bit 3, so both tables share one
+  ; stable SAT numbering.
+  jr   _ppu_sprite_base_2000
+.else
   bit  3, a
   jr   nz, _ppu_sprite_base_0000
+.endif
 _ppu_sprite_base_2000:
   ld   a, $ff                ; bit 2 = 1: sprite pattern base $2000
   jr   _ppu_sprite_base_set
