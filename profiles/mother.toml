@@ -42,6 +42,17 @@ pause_start = true
 # walk4_4f.txt (4-frame Start holds) is duration-matched and fully clean
 # through the same region -- use it when a zero-transient baseline is needed.
 # A-press parity is exact (full 30-frame holds both sides).
+# --buttons-script is INVALID for Mother lockstep (trap-triage 2026-09-25):
+# the script's SMS-$DC encoding round-trips asymmetrically. Ref decodes with
+# OperMode forced to title (FD_PAUSE_START), so "a"->SELECT and "start"->START;
+# the subject runtime decodes with the live OperMode ($99, gameplay), so
+# "a"->A but "start"->B plus the pause-tap Start ($C0=$50 vs $10 at frame
+# 1100), derailing the menu branch at the very next A-press (frame 1500:
+# $0026/$0031 OAM/text state fork; sprites compared off-route are meaningless).
+# FD_PAD_RAW (raw NES buttons + FD_PAUSE_AT) is the only valid stimulus:
+# 2600-frame naming lockstep is exact except the documented 104-frame
+# Start-hold-vs-tap pad transient ($00C0/$00DE only). Never compare visuals
+# across a buttons-script run.
 
 # Static WRAM code blob (see the WRAM-code blocker grounding at the
 # overworld bank-entry block, $951A JSR $6047). Mother copies 3 KiB from
